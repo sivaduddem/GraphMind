@@ -326,6 +326,11 @@ class GraphBuilder:
         """
         Get all downstream tables that would be impacted by changes to this table
         
+        "Downstream" means tables that DEPEND ON this table (have foreign keys pointing to it).
+        If you delete/modify this table, these downstream tables would be affected.
+        
+        Example: If employee is deleted, works_on (which references employee) would be affected.
+        
         Args:
             table_name: Name of the source table
             max_depth: Maximum number of hops to traverse (default: 3)
@@ -339,7 +344,8 @@ class GraphBuilder:
         impacted = set()
         paths = []
         
-        # BFS traversal to find all reachable nodes
+        # BFS traversal to find all tables that depend on this table
+        # We use PREDECESSORS because we want tables that point TO this table (depend on it)
         visited = {table_name}
         queue = [(table_name, 0, [table_name])]  # (current_node, depth, path)
         
@@ -349,19 +355,20 @@ class GraphBuilder:
             if depth >= max_depth:
                 continue
             
-            # Find all neighbors (tables this table points to)
-            for neighbor in self.graph.successors(current):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    impacted.add(neighbor)
-                    new_path = path + [neighbor]
+            # Find all tables that reference this table (predecessors = tables pointing TO current)
+            # These are the tables that would be affected if current table changes
+            for dependent_table in self.graph.predecessors(current):
+                if dependent_table not in visited:
+                    visited.add(dependent_table)
+                    impacted.add(dependent_table)
+                    new_path = path + [dependent_table]
                     paths.append({
                         'from': table_name,
-                        'to': neighbor,
+                        'to': dependent_table,
                         'path': new_path,
                         'hops': len(new_path) - 1
                     })
-                    queue.append((neighbor, depth + 1, new_path))
+                    queue.append((dependent_table, depth + 1, new_path))
         
         return {
             "source_table": table_name,

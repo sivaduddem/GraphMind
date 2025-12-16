@@ -28,23 +28,39 @@ class SQLParser:
         sql_content = self._normalize_sql(sql_content)
         
         # Parse CREATE TABLE statements
-        create_table_pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\((.*?)\)(?:\s*ENGINE|\s*CHARSET|\s*DEFAULT|\s*;|$)'
+        # Find CREATE TABLE and extract table body with balanced parentheses
+        create_table_start_pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\('
         
-        for match in re.finditer(create_table_pattern, sql_content, re.IGNORECASE | re.DOTALL):
+        for match in re.finditer(create_table_start_pattern, sql_content, re.IGNORECASE):
             table_name = match.group(1)
-            table_body = match.group(2)
+            start_pos = match.end() - 1  # Position of opening (
             
-            table_info = {
-                'name': table_name,
-                'columns': [],
-                'foreign_keys': [],
-                'rows': []
-            }
+            # Find matching closing parenthesis
+            depth = 0
+            end_pos = start_pos
+            for i in range(start_pos, len(sql_content)):
+                if sql_content[i] == '(':
+                    depth += 1
+                elif sql_content[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i
+                        break
             
-            # Parse columns and inline foreign keys
-            self._parse_table_body(table_body, table_info)
-            
-            self.tables.append(table_info)
+            if end_pos > start_pos:
+                table_body = sql_content[start_pos + 1:end_pos]
+                
+                table_info = {
+                    'name': table_name,
+                    'columns': [],
+                    'foreign_keys': [],
+                    'rows': []
+                }
+                
+                # Parse columns and inline foreign keys
+                self._parse_table_body(table_body, table_info)
+                
+                self.tables.append(table_info)
         
         # Parse ALTER TABLE statements for foreign keys with constraints
         alter_table_pattern = r'ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+(?:CONSTRAINT\s+`?\w+`?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)(?:\s+ON\s+DELETE\s+(\w+))?(?:\s+ON\s+UPDATE\s+(\w+))?'
@@ -155,24 +171,64 @@ class SQLParser:
                 })
             else:
                 # Regular column definition - match column name and type (including type parameters)
-                # Pattern: column_name type(parameters) or column_name type
                 # Handle: varchar(100), char(20), integer, decimal(9,0), etc.
                 # Skip any trailing constraints like "not null", "default null", etc.
-                # Use a more robust pattern that handles commas in type parameters like decimal(9, 0)
-                col_match = re.match(r'`?(\w+)`?\s+(\w+(?:\([^)]*(?:\([^)]*\)[^)]*)*\))?)', line, re.IGNORECASE)
-                if not col_match:
-                    # Fallback: simpler pattern for types without nested parentheses
-                    col_match = re.match(r'`?(\w+)`?\s+(\w+)', line, re.IGNORECASE)
                 
-                if col_match:
-                    col_name = col_match.group(1)
-                    col_type = col_match.group(2)
-                    # Only add if it's not a constraint keyword
-                    if col_name.upper() not in ['PRIMARY', 'UNIQUE', 'CONSTRAINT', 'FOREIGN', 'KEY', 'INDEX']:
-                        table_info['columns'].append({
-                            'name': col_name,
-                            'type': col_type
-                        })
+                # Extract column name (first word, may have backticks)
+                col_name_match = re.match(r'`?(\w+)`?', line)
+                if not col_name_match:
+                    continue
+                
+                col_name = col_name_match.group(1)
+                
+                # Only process if it's not a constraint keyword
+                if col_name.upper() in ['PRIMARY', 'UNIQUE', 'CONSTRAINT', 'FOREIGN', 'KEY', 'INDEX']:
+                    continue
+                
+                # Find the type by looking for the word after the column name
+                # Then extract the complete type including parameters like decimal(9, 0)
+                remaining = line[col_name_match.end():].strip()
+                
+                # Match type name - must be a valid SQL type
+                type_name_match = re.match(r'(\w+)', remaining)
+                if not type_name_match:
+                    continue
+                
+                type_name = type_name_match.group(1)
+                # Validate it's not a constraint keyword (more permissive - accept any word that's not a constraint)
+                constraint_keywords = ['primary', 'unique', 'constraint', 'foreign', 'key', 'index', 
+                                      'not', 'null', 'default', 'auto_increment', 'on', 'delete', 'update',
+                                      'references', 'engine', 'charset']
+                if type_name.lower() in constraint_keywords:
+                    continue
+                
+                remaining_after_type = remaining[type_name_match.end():].strip()
+                
+                # Check if type has parameters (parentheses)
+                if remaining_after_type.startswith('('):
+                    # Extract everything inside parentheses, handling commas
+                    depth = 0
+                    paren_end = -1
+                    for i, char in enumerate(remaining_after_type):
+                        if char == '(':
+                            depth += 1
+                        elif char == ')':
+                            depth -= 1
+                            if depth == 0:
+                                paren_end = i + 1
+                                break
+                    
+                    if paren_end > 0:
+                        col_type = type_name + remaining_after_type[:paren_end]
+                    else:
+                        col_type = type_name
+                else:
+                    col_type = type_name
+                
+                table_info['columns'].append({
+                    'name': col_name,
+                    'type': col_type
+                })
     
     def _split_table_body(self, body: str) -> List[str]:
         """Split table body by commas, respecting parentheses"""

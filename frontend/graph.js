@@ -8,6 +8,8 @@ let graphData = { nodes: [], edges: [] };
 let simulation = null;
 let selectedNode = null;
 let selectedEdge = null;
+let impactViewActive = false;
+let originalGraphData = null;
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -214,6 +216,12 @@ function renderGraph() {
     const container = window.graphContainer;
     if (!container) return;
 
+    // Stop any existing simulation
+    if (simulation) {
+        simulation.stop();
+        simulation = null;
+    }
+
     // Clear existing graph
     container.selectAll('*').remove();
 
@@ -313,22 +321,29 @@ function renderGraph() {
     // Update positions on simulation tick
     simulation.on('tick', () => {
         link.attr('d', d => {
+            // Reverse edge direction for consistent parent->child visualization
+            // In the graph data: edge goes from dependent table to referenced table (e.g., works_on -> employee)
+            // For visualization: we show parent -> child (e.g., employee -> works_on)
+            // So we swap source and target for rendering
+            const visualSource = d.target;  // The referenced table (parent)
+            const visualTarget = d.source;  // The dependent table (child)
+            
             // Calculate edge start and end points on circle perimeters
-            const dx = d.target.x - d.source.x;
-            const dy = d.target.y - d.source.y;
-            const sourceRadius = d.source.radius || 30;
-            const targetRadius = d.target.radius || 30;
+            const dx = visualTarget.x - visualSource.x;
+            const dy = visualTarget.y - visualSource.y;
+            const sourceRadius = visualSource.radius || 30;
+            const targetRadius = visualTarget.radius || 30;
             const len = Math.sqrt(dx * dx + dy * dy);
             
             if (len === 0) return '';
             
-            // Start point on source circle
-            const x1 = d.source.x + (dx / len) * sourceRadius;
-            const y1 = d.source.y + (dy / len) * sourceRadius;
+            // Start point on source circle (parent)
+            const x1 = visualSource.x + (dx / len) * sourceRadius;
+            const y1 = visualSource.y + (dy / len) * sourceRadius;
             
-            // End point on target circle
-            const x2 = d.target.x - (dx / len) * targetRadius;
-            const y2 = d.target.y - (dy / len) * targetRadius;
+            // End point on target circle (child)
+            const x2 = visualTarget.x - (dx / len) * targetRadius;
+            const y2 = visualTarget.y - (dy / len) * targetRadius;
             
             // Calculate control point for quadratic curve
             // Offset perpendicular to the line to create a smooth curve
@@ -340,7 +355,7 @@ function renderGraph() {
             const midX = (x1 + x2) / 2 + perpX;
             const midY = (y1 + y2) / 2 + perpY;
             
-            // Create quadratic Bezier curve path
+            // Create quadratic Bezier curve path (parent -> child)
             return `M ${x1} ${y1} Q ${midX} ${midY} ${x2} ${y2}`;
         });
 
@@ -367,7 +382,27 @@ function dragended(event, d) {
 }
 
 function selectNode(node) {
-    selectedNode = node;
+    // Restore full graph if impact view is active
+    if (impactViewActive) {
+        // Store node info before restoring
+        const nodeId = node.id || (typeof node === 'string' ? node : null);
+        restoreFullGraph();
+        
+        // After restore, we need to wait for graph to render, then select
+        // The restoreFullGraph will handle the selection via setTimeout
+        if (nodeId) {
+            // Update selectedNode reference so restoreFullGraph can use it
+            selectedNode = { id: nodeId };
+        }
+        return;
+    }
+    
+    // Ensure node is an object with id property
+    const nodeObj = typeof node === 'string' 
+        ? graphData.nodes.find(n => n.id === node) || { id: node }
+        : node;
+    
+    selectedNode = nodeObj;
     selectedEdge = null;
 
     // Clear all visualizations
@@ -378,11 +413,11 @@ function selectNode(node) {
     window.graphContainer.selectAll('.link').classed('selected', false);
     
     window.graphContainer.selectAll('.node')
-        .filter(d => d.id === node.id)
+        .filter(d => d.id === nodeObj.id)
         .classed('selected', true);
 
     // Show details panel
-    showNodeDetails(node);
+    showNodeDetails(nodeObj);
 }
 
 function clearAllHighlights() {
@@ -893,19 +928,19 @@ async function showDownstreamImpact(tableName) {
             html += '</ul>';
             html += '</div>';
             
-            // Highlight impacted tables in graph
-            highlightImpactedTables(impact.impacted_tables, tableName);
+            // Render impact subgraph as tree
+            renderImpactSubgraph(tableName, impact, depth);
+        } else {
+            html += '<p>No downstream tables would be affected.</p>';
+            // Restore full graph if no impact
+            if (impactViewActive) {
+                restoreFullGraph();
+            }
         }
         
-        if (impact.paths && impact.paths.length > 0) {
-            html += '<div class="impact-paths" style="margin-top: 10px;">';
-            html += '<p><strong>Impact Paths:</strong></p>';
-            impact.paths.slice(0, 10).forEach(path => {
-                html += `<p class="path-text">${path.path.join(' → ')} (${path.hops} hop${path.hops > 1 ? 's' : ''})</p>`;
-            });
-            html += '</div>';
-        }
-        
+        html += '<div style="margin-top: 10px;">';
+        html += `<button class="btn btn-secondary" onclick="restoreFullGraph()" style="font-size: 11px; padding: 5px 10px;">Show Full Graph</button>`;
+        html += '</div>';
         html += '</div>';
         resultDiv.innerHTML = html;
     } catch (error) {
@@ -913,20 +948,273 @@ async function showDownstreamImpact(tableName) {
     }
 }
 
-function highlightImpactedTables(tables, sourceTable) {
-    // Reset all nodes
-    window.graphContainer.selectAll('.node').classed('impacted', false).classed('impact-source', false);
+function renderImpactSubgraph(sourceTable, impact, depth) {
+    // Store original graph data if not already stored
+    if (!impactViewActive) {
+        originalGraphData = JSON.parse(JSON.stringify(graphData));
+        impactViewActive = true;
+    }
     
-    // Highlight source
-    window.graphContainer.selectAll('.node')
-        .filter(d => d.id === sourceTable)
-        .classed('impact-source', true);
+    // Build impact subgraph: source table + all impacted tables
+    const impactNodeSet = new Set([sourceTable, ...impact.impacted_tables]);
     
-    // Highlight impacted tables
-    window.graphContainer.selectAll('.node')
-        .filter(d => tables.includes(d.id))
-        .classed('impacted', true);
+    // Filter nodes to only include impact subgraph
+    const impactNodes = graphData.nodes.filter(node => impactNodeSet.has(node.id));
+    
+    // Filter edges to only include edges within the impact subgraph
+    // Edges should point FROM impacted tables TO source (showing dependency direction)
+    const impactEdges = graphData.edges.filter(edge => {
+        const source = typeof edge.source === 'string' ? edge.source : edge.source.id;
+        const target = typeof edge.target === 'string' ? edge.target : edge.target.id;
+        // Include edges where target is sourceTable (tables that depend on source)
+        return impactNodeSet.has(source) && impactNodeSet.has(target);
+    });
+    
+    // Build tree structure for hierarchical layout
+    const treeData = buildImpactTree(sourceTable, impact, impactNodes, impactEdges, depth);
+    
+    // Render tree layout
+    renderTreeLayout(treeData, sourceTable);
 }
+
+function buildImpactTree(sourceTable, impact, nodes, edges, maxDepth) {
+    // Create a tree structure: source is root, impacted tables are children
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
+    
+    // Build parent-child map from edges
+    // In the graph: impacted_table -> source_table (e.g., works_on -> employee)
+    // In the tree: source_table (root) has impacted_table as children
+    const childrenMap = new Map();
+    const allTables = new Set([sourceTable, ...impact.impacted_tables]);
+    allTables.forEach(table => childrenMap.set(table, []));
+    
+    // Process edges: if edge.target is sourceTable, then edge.source is a child of sourceTable
+    edges.forEach(edge => {
+        const source = typeof edge.source === 'string' ? edge.source : edge.source.id;
+        const target = typeof edge.target === 'string' ? edge.target : edge.target.id;
+        
+        if (target === sourceTable && allTables.has(source)) {
+            // This table directly depends on source - it's a direct child
+            if (!childrenMap.get(sourceTable).includes(source)) {
+                childrenMap.get(sourceTable).push(source);
+            }
+        } else if (allTables.has(source) && allTables.has(target) && target !== sourceTable) {
+            // This is an edge between two impacted tables
+            // The source depends on the target, so target is parent of source
+            if (!childrenMap.get(target).includes(source)) {
+                childrenMap.get(target).push(source);
+            }
+        }
+    });
+    
+    // Build tree structure recursively
+    function buildNode(tableName, currentDepth) {
+        const node = nodeMap.get(tableName);
+        if (!node) return null;
+        
+        const treeNode = {
+            id: tableName,
+            name: tableName,
+            data: node,
+            children: []
+        };
+        
+        if (currentDepth < maxDepth) {
+            const children = childrenMap.get(tableName) || [];
+            children.forEach(childName => {
+                const child = buildNode(childName, currentDepth + 1);
+                if (child) {
+                    treeNode.children.push(child);
+                }
+            });
+        }
+        
+        return treeNode;
+    }
+    
+    return buildNode(sourceTable, 0);
+}
+
+function renderTreeLayout(treeData, sourceTable) {
+    const container = window.graphContainer;
+    if (!container) return;
+    
+    // Stop any existing simulation
+    if (simulation) {
+        simulation.stop();
+        simulation = null;
+    }
+    
+    // Clear existing graph
+    container.selectAll('*').remove();
+    
+    if (!treeData) {
+        return;
+    }
+    
+    const width = window.innerWidth - 300;
+    const height = window.innerHeight;
+    
+    // Create tree layout (x = horizontal, y = vertical)
+    const tree = d3.tree()
+        .size([width - 200, height - 100])
+        .separation((a, b) => (a.parent === b.parent ? 1 : 2) / a.depth);
+    
+    // Convert tree data to hierarchy
+    const root = d3.hierarchy(treeData);
+    tree(root);
+    
+    // Calculate node positions
+    const nodes = root.descendants();
+    const links = root.links();
+    
+    // Create links (tree edges go from parent to child)
+    // D3 tree links: d.source is parent, d.target is child
+    // In the tree: parent (source table) -> child (impacted table)
+    // This matches the impact direction: source impacts child
+    const link = container.append('g')
+        .attr('class', 'links')
+        .selectAll('path')
+        .data(links)
+        .enter()
+        .append('path')
+        .attr('class', 'link fk impact-link')
+        .attr('marker-end', 'url(#arrow-fk)')  // Arrow at end pointing to child (impacted table)
+        .attr('fill', 'none')
+        .attr('stroke', '#2c3e50')  // Dark gray for edges
+        .attr('stroke-width', 2)
+        .attr('d', d3.linkVertical()
+            .x(d => d.y + 100)  // Horizontal position (D3 tree uses y for horizontal)
+            .y(d => d.x + 50)    // Vertical position (D3 tree uses x for vertical, parent at top)
+        );
+    
+    // Create nodes
+    const node = container.append('g')
+        .attr('class', 'nodes')
+        .selectAll('g')
+        .data(nodes)
+        .enter()
+        .append('g')
+        .attr('class', d => `node ${d.data.data?.source || 'sql'} ${d.data.id === sourceTable ? 'impact-source' : 'impacted'}`)
+        .attr('transform', d => `translate(${d.y + 100},${d.x + 50})`)
+        .call(d3.drag()
+            .on('start', dragstarted)
+            .on('drag', dragged)
+            .on('end', dragended)
+        )
+        .on('click', (event, d) => {
+            event.stopPropagation();
+            selectNode(d.data.data);
+        })
+        .on('mouseover', (event, d) => {
+            showTooltip(event, getNodeTooltip(d.data.data));
+        })
+        .on('mouseout', hideTooltip);
+    
+    // Add circles
+    node.append('circle')
+        .attr('r', d => {
+            const textLength = d.data.id.length;
+            return Math.min(30 + (textLength * 3), 70);
+        })
+        .attr('fill', '#3498db')  // Uniform blue for all nodes
+        .attr('stroke', '#2c3e50')  // Dark gray border for all nodes
+        .attr('stroke-width', 2);  // Uniform stroke width
+    
+    // Add labels
+    node.append('text')
+        .text(d => d.data.id)
+        .attr('dy', 4)
+        .attr('font-size', '12px')
+        .attr('text-anchor', 'middle')
+        .attr('fill', 'white')
+        .attr('font-weight', '500');
+    
+    // Center the tree
+    const bounds = container.node().getBBox();
+    const dx = width / 2 - (bounds.x + bounds.width / 2);
+    const dy = height / 2 - (bounds.y + bounds.height / 2);
+    container.attr('transform', `translate(${dx},${dy})`);
+}
+
+function restoreFullGraph() {
+    impactViewActive = false;
+    
+    // Stop any existing simulation (from tree layout)
+    if (simulation) {
+        simulation.stop();
+        simulation = null;
+    }
+    
+    // Reset container transform (tree layout may have offset it)
+    const container = window.graphContainer;
+    const svg = window.graphSvg;
+    
+    if (container && svg) {
+        // Reset container transform to identity
+        container.attr('transform', d3.zoomIdentity);
+        
+        // Reset zoom by getting the zoom transform and resetting it
+        // Use the zoom transform API to reset
+        const currentTransform = d3.zoomTransform(svg.node());
+        if (currentTransform && (currentTransform.k !== 1 || currentTransform.x !== 0 || currentTransform.y !== 0)) {
+            // Create a new zoom behavior and apply identity transform
+            const zoom = d3.zoom()
+                .scaleExtent([0.1, 4])
+                .on('zoom', (event) => {
+                    container.attr('transform', event.transform);
+                });
+            svg.call(zoom.transform, d3.zoomIdentity);
+        }
+    }
+    
+    if (originalGraphData) {
+        graphData = JSON.parse(JSON.stringify(originalGraphData));
+        originalGraphData = null;
+    }
+    
+    // Reset node positions (they might have been set by tree layout)
+    if (graphData.nodes) {
+        graphData.nodes.forEach(node => {
+            delete node.x;
+            delete node.y;
+            delete node.fx;
+            delete node.fy;
+            delete node.vx;
+            delete node.vy;
+        });
+    }
+    
+    // Store the selected node ID before rendering
+    const selectedNodeId = selectedNode ? (selectedNode.id || selectedNode) : null;
+    
+    // Reload graph from server to ensure clean state
+    // This is more reliable than trying to manually reset everything
+    loadGraph().then(() => {
+        // Clear impact highlights
+        clearAllHighlights();
+        
+        // Re-select node after graph is loaded
+        if (selectedNodeId) {
+            setTimeout(() => {
+                const nodeObj = graphData.nodes.find(n => n.id === selectedNodeId);
+                if (nodeObj) {
+                    selectedNode = nodeObj;
+                    const nodes = window.graphContainer.selectAll('.node');
+                    if (nodes.size() > 0) {
+                        nodes
+                            .filter(d => d.id === selectedNodeId)
+                            .classed('selected', true);
+                        // Show details panel
+                        showNodeDetails(nodeObj);
+                    }
+                }
+            }, 200);
+        }
+    });
+}
+
+// Removed - now using tree layout instead
 
 async function findJoinPath(fromTable) {
     const resultDiv = document.getElementById(`pathResult-${fromTable}`);

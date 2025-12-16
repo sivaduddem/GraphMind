@@ -8,7 +8,7 @@
 - **SQL Schema Import**: Parse MySQL DDL files to extract tables, columns, foreign keys, and row data
 - **CSV Data Analysis**: Upload CSV files and automatically infer relationships with existing tables
 - **Interactive Graph Visualization**: D3.js-powered force-directed graph with zoom, pan, drag, and search
-- **Relationship Types**: 
+- **Relationship Types**:
   - **FK edges**: Explicit foreign keys from SQL schemas (blue)
   - **Inferred edges**: Relationships detected through data pattern analysis (red, dashed)
 - **Confidence Scoring**: Inferred relationships include confidence scores (0-1) with detailed statistics
@@ -16,10 +16,12 @@
 ### 🔥 Advanced Graph Analytics
 
 #### A. Impact / Blast Radius Analysis
+- **Tree View Visualization**: Shows impact as a clean hierarchical tree (parent → child)
 - **Downstream Impact Traversal**: Click any table to see all downstream tables that would be affected by changes
 - **Depth-Limited Analysis**: Configurable traversal depth (1-10 hops)
-- **Visual Highlighting**: Impacted tables highlighted in orange, source table in red
-- **Path Visualization**: Shows impact paths with hop counts
+- **Focused View**: Impact tree view hides unrelated nodes for clarity
+- **Parent-Child Relationships**: Clear visualization showing source table (parent) impacting dependent tables (children)
+- **Full Graph Restoration**: "Show Full Graph" button to return to the complete graph view
 - **Use Cases**: "If employee changes, what breaks?" - Perfect for schema migration planning
 
 #### B. Critical Table Detection
@@ -73,14 +75,16 @@
 
 ### Frontend (D3.js)
 - **Interactive Visualization**: Force-directed graph layout with D3.js
-- **Controls**: Toggle FK/inferred edges, confidence slider, critical tables toggle, search functionality
+- **Controls**: Toggle FK/inferred edges, critical tables toggle, search functionality
+- **Tree Layout**: Hierarchical tree visualization for impact analysis using D3 tree layout
 - **Details Panel**: Shows table columns, relationships, data, and analytics:
-  - Impact analysis with depth control
+  - Impact analysis with depth control and tree view
   - Join path finder
   - Constraint simulation
   - Enhanced edge explainability
 - **Visual Highlighting**: Dynamic highlighting for impacts, paths, and critical tables
 - **Data Table**: View and select rows for simulation operations
+- **View Management**: Seamless switching between full graph and focused impact tree views
 
 ## Installation
 
@@ -131,7 +135,7 @@ The API will be available at `http://localhost:8000`
 - **Click Node**: View table details, columns, relationships, and data
 - **Click Edge**: View relationship details and inference explanation
 - **Search**: Type in the search box to highlight matching tables
-- **Filter**: Use confidence slider and checkboxes to filter edges
+- **Filter**: Use checkboxes to toggle FK edges and inferred edges visibility
 
 ### Advanced Features
 
@@ -139,8 +143,11 @@ The API will be available at `http://localhost:8000`
 1. Click any table node to open the details panel
 2. Click "Show Downstream Impact" button
 3. Adjust depth slider (1-10 hops)
-4. See all affected tables highlighted in the graph
-5. View impact paths and statistics
+4. The graph switches to a focused tree view showing only the impact subgraph
+5. Tree layout shows parent (source table) → children (impacted tables) with clear hierarchy
+6. View impact statistics and affected tables list
+7. Click "Show Full Graph" to return to the complete graph view
+8. Clicking a different node automatically restores the full graph
 
 #### Critical Table Detection
 1. Toggle "Highlight Critical Tables" in the sidebar
@@ -187,7 +194,7 @@ The API will be available at `http://localhost:8000`
 ### Core Endpoints
 - `POST /api/upload/sql` - Upload and parse SQL schema file
 - `POST /api/upload/csv` - Upload and analyze CSV file
-- `GET /api/graph?min_confidence=0.0` - Get graph data
+- `GET /api/graph` - Get graph data (all edges included)
 - `GET /api/table/{table_name}` - Get table details
 - `GET /api/edge/{from_table}/{to_table}` - Get edge details
 - `GET /api/subgraph?tables=table1,table2&depth=1` - Get subgraph
