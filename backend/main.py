@@ -58,7 +58,12 @@ async def upload_sql(file: UploadFile = File(...)):
         
         # Add tables and relationships to graph
         for table in tables:
-            graph_builder.add_table(table['name'], 'sql', table.get('columns', []))
+            graph_builder.add_table(
+                table['name'], 
+                'sql', 
+                table.get('columns', []),
+                table.get('rows', [])
+            )
         
         # Add foreign key relationships
         for table in tables:
@@ -98,8 +103,11 @@ async def upload_csv(file: UploadFile = File(...), table_name: Optional[str] = N
         analyzer = CSVAnalyzer()
         profile = analyzer.profile_csv(df, table_name)
         
+        # Convert DataFrame to list of dictionaries for row storage
+        rows = df.to_dict('records')
+        
         # Add table to graph
-        graph_builder.add_table(table_name, 'csv', profile['columns'])
+        graph_builder.add_table(table_name, 'csv', profile['columns'], rows)
         
         # Infer relationships with existing tables
         inferred_edges = analyzer.infer_relationships(df, table_name, graph_builder)
@@ -175,11 +183,13 @@ async def simulate_delete(request: Dict = Body(...)):
     """Simulate a DELETE operation on a table"""
     try:
         table_name = request.get('table')
+        row_identifiers = request.get('row_identifiers', None)  # List of primary key values or row indices
+        
         if not table_name:
             raise HTTPException(status_code=400, detail="Table name is required")
         
         simulator = ConstraintSimulator(graph_builder)
-        result = simulator.simulate_delete(table_name)
+        result = simulator.simulate_delete(table_name, row_identifiers)
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -191,12 +201,14 @@ async def simulate_update(request: Dict = Body(...)):
     try:
         table_name = request.get('table')
         column = request.get('column')
+        row_identifiers = request.get('row_identifiers', None)  # List of primary key values or row indices
+        new_value = request.get('new_value', None)  # New value for the column
         
         if not table_name:
             raise HTTPException(status_code=400, detail="Table name is required")
         
         simulator = ConstraintSimulator(graph_builder)
-        result = simulator.simulate_update(table_name, column)
+        result = simulator.simulate_update(table_name, column, row_identifiers, new_value)
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -209,6 +221,60 @@ async def get_delete_risk(table_name: str):
         simulator = ConstraintSimulator(graph_builder)
         risk = simulator.get_delete_risk_score(table_name)
         return risk
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/table/{table_name}/data")
+async def get_table_data(table_name: str):
+    """Get row data for a specific table"""
+    try:
+        rows = graph_builder.get_table_rows(table_name)
+        table_details = graph_builder.get_table_details(table_name)
+        if not table_details:
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+        
+        return {
+            "table_name": table_name,
+            "rows": rows,
+            "columns": table_details.get('columns', [])
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/table/{table_name}/impact")
+async def get_table_impact(table_name: str, depth: int = Query(3, ge=1, le=10)):
+    """Get downstream impact analysis for a table"""
+    try:
+        impact = graph_builder.get_downstream_impact(table_name, max_depth=depth)
+        return impact
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/graph/critical-tables")
+async def get_critical_tables():
+    """Get critical tables analysis"""
+    try:
+        critical = graph_builder.get_critical_tables()
+        return critical
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/path/{from_table}/{to_table}")
+async def find_join_path(
+    from_table: str,
+    to_table: str,
+    max_depth: int = Query(5, ge=1, le=10)
+):
+    """Find join paths between two tables"""
+    try:
+        paths = graph_builder.find_join_paths(from_table, to_table, max_depth=max_depth)
+        return paths
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

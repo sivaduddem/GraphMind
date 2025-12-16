@@ -12,9 +12,14 @@ class ConstraintSimulator:
     def __init__(self, graph_builder: GraphBuilder):
         self.graph_builder = graph_builder
     
-    def simulate_delete(self, table_name: str) -> Dict[str, Any]:
+    def simulate_delete(self, table_name: str, row_identifiers: Optional[List[Any]] = None) -> Dict[str, Any]:
         """
         Simulate a DELETE operation on a table
+        
+        Args:
+            table_name: Name of the table
+            row_identifiers: Optional list of primary key values or row indices to delete.
+                           If None, simulates deletion of all rows.
         
         Returns:
             Dictionary with result, error_type, blocked_by, and explanation
@@ -114,13 +119,16 @@ class ConstraintSimulator:
                 "warnings": warnings
             }
     
-    def simulate_update(self, table_name: str, column: Optional[str] = None) -> Dict[str, Any]:
+    def simulate_update(self, table_name: str, column: Optional[str] = None, row_identifiers: Optional[List[Any]] = None, new_value: Optional[Any] = None) -> Dict[str, Any]:
         """
         Simulate an UPDATE operation on a table column
         
         Args:
             table_name: Name of the table
             column: Name of the column being updated (if None, assumes PK update)
+            row_identifiers: Optional list of primary key values or row indices to update.
+                           If None, simulates update of all rows.
+            new_value: Optional new value for the column
         
         Returns:
             Dictionary with result, error_type, blocked_by, and explanation

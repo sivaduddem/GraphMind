@@ -13,10 +13,11 @@ class GraphBuilder:
     def __init__(self):
         self.graph = nx.DiGraph()
         self.table_data = {}  # Store table metadata
+        self.table_rows = {}  # Store table row data
         self._json_cache = None  # Cache for JSON output
         self._cache_confidence = None  # Confidence threshold used for cache
     
-    def add_table(self, table_name: str, source: str, columns: List[Dict[str, Any]]):
+    def add_table(self, table_name: str, source: str, columns: List[Dict[str, Any]], rows: Optional[List[Dict[str, Any]]] = None):
         """Add a table node to the graph"""
         if not self.graph.has_node(table_name):
             self.graph.add_node(table_name)
@@ -25,12 +26,19 @@ class GraphBuilder:
                 'source': source,
                 'columns': columns
             }
+            self.table_rows[table_name] = rows or []
         else:
             # Update existing table
             self.table_data[table_name]['columns'] = columns
+            if rows is not None:
+                self.table_rows[table_name] = rows
         
         # Invalidate cache
         self._invalidate_cache()
+    
+    def get_table_rows(self, table_name: str) -> List[Dict[str, Any]]:
+        """Get all rows for a table"""
+        return self.table_rows.get(table_name, [])
     
     def add_fk_edge(
         self,
@@ -132,32 +140,39 @@ class GraphBuilder:
         details['incoming_edges'] = []
         
         for source, target, data in self.graph.edges(data=True):
-            if source == table_name:
-                edge_info = {
-                    'target': target,
-                    'kind': data.get('kind', 'unknown'),
-                    'from_columns': data.get('from_columns', []),
-                    'to_columns': data.get('to_columns', []),
-                    'confidence': data.get('confidence', 1.0)
-                }
-                if data.get('on_delete'):
-                    edge_info['on_delete'] = data.get('on_delete')
-                if data.get('on_update'):
-                    edge_info['on_update'] = data.get('on_update')
-                details['outgoing_edges'].append(edge_info)
-            if target == table_name:
-                edge_info = {
-                    'source': source,
-                    'kind': data.get('kind', 'unknown'),
-                    'from_columns': data.get('from_columns', []),
-                    'to_columns': data.get('to_columns', []),
-                    'confidence': data.get('confidence', 1.0)
-                }
-                if data.get('on_delete'):
-                    edge_info['on_delete'] = data.get('on_delete')
-                if data.get('on_update'):
-                    edge_info['on_update'] = data.get('on_update')
-                details['incoming_edges'].append(edge_info)
+            # Handle multiple edges between same nodes
+            if 'edges' in data:
+                edge_list = data['edges']
+            else:
+                edge_list = [data]
+            
+            for edge_data in edge_list:
+                if source == table_name:
+                    edge_info = {
+                        'target': target,
+                        'kind': edge_data.get('kind', 'unknown'),
+                        'from_columns': edge_data.get('from_columns', []),
+                        'to_columns': edge_data.get('to_columns', []),
+                        'confidence': edge_data.get('confidence', 1.0)
+                    }
+                    if edge_data.get('on_delete'):
+                        edge_info['on_delete'] = edge_data.get('on_delete')
+                    if edge_data.get('on_update'):
+                        edge_info['on_update'] = edge_data.get('on_update')
+                    details['outgoing_edges'].append(edge_info)
+                if target == table_name:
+                    edge_info = {
+                        'source': source,
+                        'kind': edge_data.get('kind', 'unknown'),
+                        'from_columns': edge_data.get('from_columns', []),
+                        'to_columns': edge_data.get('to_columns', []),
+                        'confidence': edge_data.get('confidence', 1.0)
+                    }
+                    if edge_data.get('on_delete'):
+                        edge_info['on_delete'] = edge_data.get('on_delete')
+                    if edge_data.get('on_update'):
+                        edge_info['on_update'] = edge_data.get('on_update')
+                    details['incoming_edges'].append(edge_info)
         
         return details
     
@@ -240,6 +255,7 @@ class GraphBuilder:
         """Clear the entire graph"""
         self.graph.clear()
         self.table_data.clear()
+        self.table_rows.clear()
         self._invalidate_cache()
     
     def get_subgraph(self, table_names: List[str], depth: int = 1) -> Dict[str, Any]:
@@ -305,4 +321,204 @@ class GraphBuilder:
                     })
         
         return {'nodes': nodes, 'edges': edges}
+    
+    def get_downstream_impact(self, table_name: str, max_depth: int = 3) -> Dict[str, Any]:
+        """
+        Get all downstream tables that would be impacted by changes to this table
+        
+        Args:
+            table_name: Name of the source table
+            max_depth: Maximum number of hops to traverse (default: 3)
+        
+        Returns:
+            Dictionary with impacted_tables, paths, and statistics
+        """
+        if not self.graph.has_node(table_name):
+            return {"impacted_tables": [], "paths": [], "error": "Table not found"}
+        
+        impacted = set()
+        paths = []
+        
+        # BFS traversal to find all reachable nodes
+        visited = {table_name}
+        queue = [(table_name, 0, [table_name])]  # (current_node, depth, path)
+        
+        while queue:
+            current, depth, path = queue.pop(0)
+            
+            if depth >= max_depth:
+                continue
+            
+            # Find all neighbors (tables this table points to)
+            for neighbor in self.graph.successors(current):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    impacted.add(neighbor)
+                    new_path = path + [neighbor]
+                    paths.append({
+                        'from': table_name,
+                        'to': neighbor,
+                        'path': new_path,
+                        'hops': len(new_path) - 1
+                    })
+                    queue.append((neighbor, depth + 1, new_path))
+        
+        return {
+            "source_table": table_name,
+            "impacted_tables": sorted(list(impacted)),
+            "impact_count": len(impacted),
+            "paths": paths,
+            "max_depth": max_depth
+        }
+    
+    def get_critical_tables(self) -> Dict[str, Any]:
+        """
+        Detect critical tables using graph analytics:
+        - High in-degree (many dependents)
+        - Articulation points (removing breaks graph)
+        - High betweenness centrality (bottleneck nodes)
+        
+        Returns:
+            Dictionary with critical tables and their metrics
+        """
+        import networkx as nx
+        
+        # Convert to undirected for articulation points
+        undirected = self.graph.to_undirected()
+        
+        # Calculate metrics
+        in_degree = dict(self.graph.in_degree())
+        out_degree = dict(self.graph.out_degree())
+        betweenness = nx.betweenness_centrality(self.graph)
+        
+        # Find articulation points (nodes whose removal disconnects graph)
+        articulation_points = set(nx.articulation_points(undirected))
+        
+        # Calculate criticality score for each table
+        critical_tables = {}
+        max_in_degree = max(in_degree.values()) if in_degree.values() else 1
+        max_betweenness = max(betweenness.values()) if betweenness.values() else 1
+        
+        for node in self.graph.nodes():
+            in_deg = in_degree.get(node, 0)
+            out_deg = out_degree.get(node, 0)
+            betw = betweenness.get(node, 0)
+            is_articulation = node in articulation_points
+            
+            # Normalized scores (0-1)
+            in_degree_score = in_deg / max_in_degree if max_in_degree > 0 else 0
+            betweenness_score = betw / max_betweenness if max_betweenness > 0 else 0
+            
+            # Combined criticality score
+            criticality = (
+                in_degree_score * 0.4 +  # High dependency score
+                betweenness_score * 0.4 +  # Bottleneck score
+                (1.0 if is_articulation else 0.0) * 0.2  # Articulation point bonus
+            )
+            
+            critical_tables[node] = {
+                'in_degree': in_deg,
+                'out_degree': out_deg,
+                'betweenness_centrality': betw,
+                'is_articulation_point': is_articulation,
+                'criticality_score': criticality
+            }
+        
+        # Sort by criticality
+        sorted_critical = sorted(
+            critical_tables.items(),
+            key=lambda x: x[1]['criticality_score'],
+            reverse=True
+        )
+        
+        return {
+            "critical_tables": dict(sorted_critical),
+            "top_critical": [name for name, _ in sorted_critical[:10]]
+        }
+    
+    def find_join_paths(self, from_table: str, to_table: str, max_depth: int = 5) -> Dict[str, Any]:
+        """
+        Find join paths between two tables
+        
+        Args:
+            from_table: Source table name
+            to_table: Target table name
+            max_depth: Maximum path length to search
+        
+        Returns:
+            Dictionary with paths, shortest path, and join details
+        """
+        if not self.graph.has_node(from_table) or not self.graph.has_node(to_table):
+            return {
+                "error": "One or both tables not found",
+                "from_table": from_table,
+                "to_table": to_table
+            }
+        
+        try:
+            import networkx as nx
+            
+            # Find shortest path
+            try:
+                shortest_path = nx.shortest_path(self.graph, from_table, to_table)
+            except nx.NetworkXNoPath:
+                shortest_path = None
+            
+            # Find all simple paths (up to max_depth)
+            all_paths = []
+            try:
+                for path in nx.all_simple_paths(self.graph, from_table, to_table, cutoff=max_depth):
+                    all_paths.append(path)
+            except nx.NetworkXNoPath:
+                pass
+            
+            # Build path details with join information
+            path_details = []
+            for path in all_paths[:10]:  # Limit to top 10 paths
+                edges_in_path = []
+                for i in range(len(path) - 1):
+                    source = path[i]
+                    target = path[i + 1]
+                    edge_data = self.get_edge_details(source, target)
+                    if edge_data:
+                        if 'edges' in edge_data:
+                            # Use first edge
+                            edge = edge_data['edges'][0]
+                        else:
+                            edge = edge_data
+                        
+                        edges_in_path.append({
+                            'from_table': source,
+                            'to_table': target,
+                            'from_columns': edge.get('from_columns', []),
+                            'to_columns': edge.get('to_columns', []),
+                            'kind': edge.get('kind', 'unknown'),
+                            'confidence': edge.get('confidence', 1.0)
+                        })
+                
+                path_details.append({
+                    'path': path,
+                    'hops': len(path) - 1,
+                    'edges': edges_in_path,
+                    'is_shortest': path == shortest_path if shortest_path else False
+                })
+            
+            # Sort by path length
+            path_details.sort(key=lambda x: x['hops'])
+            
+            return {
+                "from_table": from_table,
+                "to_table": to_table,
+                "shortest_path": shortest_path,
+                "shortest_path_length": len(shortest_path) - 1 if shortest_path else None,
+                "total_paths_found": len(all_paths),
+                "paths": path_details[:5],  # Return top 5 paths
+                "max_depth_searched": max_depth
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "from_table": from_table,
+                "to_table": to_table
+            }
 
