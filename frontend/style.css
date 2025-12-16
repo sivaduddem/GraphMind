@@ -874,6 +874,45 @@ body {
     background: rgba(52, 152, 219, 0.2) !important;
 }
 
+/* Prevent interaction with line number gutter area */
+.CodeMirror-gutter {
+    pointer-events: none !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+    cursor: default !important;
+}
+
+.CodeMirror-linenumber {
+    pointer-events: none !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+    cursor: default !important;
+}
+
+/* Prevent text selection in gutter area */
+.CodeMirror-gutter-wrapper {
+    pointer-events: none !important;
+}
+
+/* Ensure content area starts after gutter */
+.CodeMirror-lines {
+    padding-left: 0 !important;
+}
+
+.CodeMirror-line {
+    padding-left: 0 !important;
+}
+
+/* Prevent selection and editing before line 1 */
+.CodeMirror-line:first-child {
+    /* Ensure first line is always accessible */
+}
+
+/* Hide any content that might appear before line 1 */
+.CodeMirror-lines {
+    /* Ensure content starts at line 1 */
+}
+
 .join-tables-container {
     display: flex;
     gap: 20px;

@@ -59,6 +59,9 @@ class QueryVisualizer:
                 'query_id': str
             }
         """
+        # Store original query for reference
+        original_query = query_text
+        
         # Remove "CREATE OR REPLACE VIEW viewname AS" prefix if present
         # Extract only the SELECT statement
         query_lower = query_text.lower().strip()
@@ -67,9 +70,9 @@ class QueryVisualizer:
             select_idx = query_lower.find('select')
             if select_idx >= 0:
                 query_text = query_text[select_idx:].strip()
-                # Remove trailing semicolon if present
-                if query_text.endswith(';'):
-                    query_text = query_text[:-1].strip()
+        
+        # Note: We keep the trailing semicolon during parsing so sqlparse can handle it correctly
+        # Semicolons in the middle (like "employee;") will be stripped from table names during extraction
         
         # Check for UNION queries
         has_union = ' union ' in query_lower
@@ -250,7 +253,7 @@ class QueryVisualizer:
             # Handle "table alias" or "table AS alias"
             parts = from_clause.split()
             if parts:
-                from_table = parts[0].strip('"\'`')
+                from_table = parts[0].strip('"\'`').rstrip(';')  # Remove semicolon if present in middle
                 # Skip alias if present
                 if len(parts) > 1 and parts[1].upper() not in ['AS', 'ON', 'USING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'JOIN']:
                     # parts[1] might be an alias, but we already got the table name
@@ -295,7 +298,7 @@ class QueryVisualizer:
             
             join_table_clause = query_text[join_start:table_end].strip()
             parts = join_table_clause.split()
-            join_table = parts[0].strip('"\'`') if parts else None
+            join_table = parts[0].strip('"\'`').rstrip(';') if parts else None  # Remove semicolon if present in middle
             
             # Find ON condition
             join_condition = None

@@ -108,58 +108,247 @@ window.queryVisualizer = {
                 indentWithTabs: true,
                 smartIndent: true,
                 autofocus: true,
-                firstLineNumber: 1
+                firstLineNumber: 1,
+                readOnly: false,
+                // Prevent editing in gutter
+                gutters: ['CodeMirror-linenumbers']
             });
             
-            // Prevent editing before line 1 - use a more robust approach
+            // Ensure editor content starts at line 0 (displayed as line 1)
+            // Remove any content that might exist before line 0
+            const currentValue = this.sqlEditor.getValue();
+            if (currentValue) {
+                const lines = currentValue.split('\n');
+                // Ensure we start with content at line 0
+                const cleanedValue = lines.join('\n');
+                if (cleanedValue !== currentValue) {
+                    this.sqlEditor.setValue(cleanedValue);
+                }
+            }
+            
+            // Prevent editing before line 1 (line 0 in CodeMirror) and in gutter area on ANY line
             this.sqlEditor.on('beforeChange', (cm, change) => {
+                // Block any changes that affect lines before line 0 (the first line)
                 if (change.from.line < 0 || change.to.line < 0) {
                     change.cancel();
+                    return;
+                }
+                // Prevent changes that start before column 0 (in gutter area) on ANY line
+                if (change.from.ch < 0 || change.to.ch < 0) {
+                    change.cancel();
+                    // Move cursor to start of line
                     setTimeout(() => {
                         const cursor = cm.getCursor();
-                        if (cursor.line < 0) {
-                            cm.setCursor({line: 0, ch: Math.max(0, cursor.ch)});
-                        }
+                        cm.setCursor({line: Math.max(0, cursor.line), ch: 0});
                     }, 0);
+                    return;
+                }
+                // Also prevent inserting newlines that would create content before line 0
+                if (change.text && change.text.some((line, idx) => {
+                    const lineNum = change.from.line + idx;
+                    return lineNum < 0;
+                })) {
+                    change.cancel();
+                    return;
                 }
             });
             
-            // Prevent cursor from going before line 1
+            // Prevent cursor from going before line 1 (line 0 in CodeMirror) or before column 0 (gutter)
             const checkCursor = () => {
                 const cursor = this.sqlEditor.getCursor();
                 if (cursor.line < 0) {
-                    this.sqlEditor.setCursor({line: 0, ch: Math.max(0, cursor.ch)});
+                    this.sqlEditor.setCursor({line: 0, ch: 0});
+                } else if (cursor.ch < 0) {
+                    // Cursor is in gutter area, move to start of line
+                    this.sqlEditor.setCursor({line: cursor.line, ch: 0});
                 }
             };
             
+            // Check cursor position on any activity
             this.sqlEditor.on('cursorActivity', (cm) => {
                 checkCursor();
                 this.onLineChange();
             });
             
-            // Prevent clicking before line 1
+            // Prevent clicking in gutter or before content starts on ANY line
             this.sqlEditor.on('mousedown', (cm, event) => {
-                setTimeout(() => {
+                // Check if click is in the gutter area (line numbers)
+                const gutter = cm.getGutterElement();
+                if (gutter && gutter.contains(event.target)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    // Move cursor to start of the line that was clicked
                     const coords = cm.coordsChar({left: event.clientX, top: event.clientY});
-                    if (coords && coords.line < 0) {
+                    if (coords) {
+                        cm.setCursor({line: Math.max(0, coords.line), ch: 0});
+                    }
+                    return;
+                }
+                
+                // Get the editor's display area to check if click is in gutter
+                const display = cm.getWrapperElement();
+                const rect = display.getBoundingClientRect();
+                const gutterWidth = gutter ? gutter.offsetWidth : 0;
+                
+                // Check if click X position is within gutter area
+                const clickX = event.clientX - rect.left;
+                if (clickX < gutterWidth) {
+                    // Click was in gutter area, prevent it and move cursor to start of line
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const coords = cm.coordsChar({left: event.clientX, top: event.clientY});
+                    if (coords) {
+                        cm.setCursor({line: Math.max(0, coords.line), ch: 0});
+                    }
+                    return;
+                }
+                
+                // Check if click is before content starts (negative column) on any line
+                const coords = cm.coordsChar({left: event.clientX, top: event.clientY});
+                if (coords) {
+                    if (coords.line < 0) {
+                        event.preventDefault();
                         cm.setCursor({line: 0, ch: 0});
+                        return;
+                    } else if (coords.ch < 0) {
+                        // Click was in gutter area, move to start of line
+                        event.preventDefault();
+                        cm.setCursor({line: coords.line, ch: 0});
+                        return;
+                    }
+                }
+                
+                // Double-check after a short delay to catch any edge cases
+                setTimeout(() => {
+                    const cursor = cm.getCursor();
+                    if (cursor.ch < 0) {
+                        // Cursor somehow ended up in gutter, move to start of line
+                        cm.setCursor({line: cursor.line, ch: 0});
+                    }
+                }, 10);
+            });
+            
+            // Prevent key navigation before line 1 or in gutter area on ANY line
+            this.sqlEditor.on('keydown', (cm, event) => {
+                const cursor = cm.getCursor();
+                if (cursor.line < 0) {
+                    event.preventDefault();
+                    cm.setCursor({line: 0, ch: 0});
+                    return;
+                }
+                // Prevent cursor from being in gutter (negative column) on ANY line
+                if (cursor.ch < 0) {
+                    event.preventDefault();
+                    cm.setCursor({line: cursor.line, ch: 0});
+                    return;
+                }
+                // Prevent arrow up, home, page up from going below line 0
+                if (cursor.line === 0) {
+                    if (['ArrowUp', 'Home'].includes(event.key)) {
+                        event.preventDefault();
+                        cm.setCursor({line: 0, ch: 0});
+                        return;
+                    }
+                }
+                // Prevent arrow left from going into gutter on any line
+                if (event.key === 'ArrowLeft' && cursor.ch === 0) {
+                    // If at start of line, prevent going into gutter
+                    // Allow moving to previous line if not on line 0
+                    if (cursor.line > 0) {
+                        // Will move to end of previous line, which is fine
+                        return;
+                    } else {
+                        // On line 0, prevent any left movement
+                        event.preventDefault();
+                        return;
+                    }
+                }
+                // Prevent typing when cursor might be in gutter (double-check after keydown)
+                setTimeout(() => {
+                    const newCursor = cm.getCursor();
+                    if (newCursor.ch < 0) {
+                        cm.setCursor({line: newCursor.line, ch: 0});
                     }
                 }, 0);
             });
             
-            // Also prevent key navigation before line 1
-            this.sqlEditor.on('keydown', (cm, event) => {
-                const cursor = cm.getCursor();
-                if (cursor.line < 0) {
-                    if (['ArrowUp', 'Home', 'PageUp'].includes(event.key)) {
-                        event.preventDefault();
+            // Prevent paste operations that would insert before line 0 or in gutter
+            this.sqlEditor.on('paste', (cm, event) => {
+                setTimeout(() => {
+                    const cursor = cm.getCursor();
+                    if (cursor.line < 0) {
                         cm.setCursor({line: 0, ch: 0});
+                    } else if (cursor.ch < 0) {
+                        // Cursor is in gutter area, move to start of line
+                        cm.setCursor({line: cursor.line, ch: 0});
+                    }
+                }, 0);
+            });
+            
+            // Additional protection: prevent input when cursor might be in gutter
+            this.sqlEditor.on('inputRead', (cm) => {
+                const cursor = cm.getCursor();
+                if (cursor.ch < 0) {
+                    // Cursor is in gutter, move to start of line
+                    cm.setCursor({line: cursor.line, ch: 0});
+                }
+            });
+            
+            // Additional safety: check on focus and after any operation
+            this.sqlEditor.on('focus', checkCursor);
+            
+            // After any change, ensure no content exists before line 0 and cursor is not in gutter
+            this.sqlEditor.on('change', (cm) => {
+                checkCursor();
+                // Get all lines
+                const lineCount = cm.lineCount();
+                const doc = cm.getDoc();
+                
+                // Check if there's any content before line 0 (shouldn't happen, but be safe)
+                // CodeMirror uses 0-based indexing, so line 0 is the first line
+                // If somehow content exists before line 0, remove it
+                if (lineCount > 0) {
+                    // Ensure cursor is at least at line 0 and column 0 (not in gutter)
+                    const cursor = cm.getCursor();
+                    if (cursor.line < 0) {
+                        cm.setCursor({line: 0, ch: 0});
+                    } else if (cursor.ch < 0) {
+                        // Cursor somehow got into gutter area, move to start of line
+                        cm.setCursor({line: cursor.line, ch: 0});
                     }
                 }
             });
             
-            // Additional safety: check on focus
-            this.sqlEditor.on('focus', checkCursor);
+            // Ensure editor starts at line 0, column 0 (not in gutter)
+            this.sqlEditor.setCursor({line: 0, ch: 0});
+            
+            // Prevent any programmatic access that might create content before line 0
+            const originalSetValue = this.sqlEditor.setValue.bind(this.sqlEditor);
+            this.sqlEditor.setValue = (value) => {
+                // Ensure value doesn't start with newlines that would create content before line 0
+                const cleanedValue = value ? value.replace(/^\n+/, '') : value;
+                originalSetValue(cleanedValue);
+                // Reset cursor to line 0, column 0 (not in gutter)
+                setTimeout(() => {
+                    const cursor = this.sqlEditor.getCursor();
+                    this.sqlEditor.setCursor({line: Math.max(0, cursor.line), ch: Math.max(0, cursor.ch)});
+                }, 0);
+            };
+            
+            // Additional protection: monitor cursor position continuously to prevent gutter typing on ANY line
+            let lastCursorCheck = {line: 0, ch: 0};
+            setInterval(() => {
+                const cursor = this.sqlEditor.getCursor();
+                if (cursor.line < 0) {
+                    // Cursor is before line 0
+                    this.sqlEditor.setCursor({line: 0, ch: 0});
+                } else if (cursor.ch < 0) {
+                    // Cursor is in gutter area on ANY line - move to start of that line
+                    this.sqlEditor.setCursor({line: cursor.line, ch: 0});
+                } else {
+                    lastCursorCheck = cursor;
+                }
+            }, 50); // Check every 50ms for more responsive protection
         }
         
         // Load available datasets
@@ -257,6 +446,13 @@ window.queryVisualizer = {
         
         if (!queryText.trim()) {
             alert('Please enter a SQL query');
+            return;
+        }
+        
+        // Require semicolon at the end of the query
+        const trimmedQuery = queryText.trim();
+        if (!trimmedQuery.endsWith(';')) {
+            alert('SQL query must end with a semicolon (;). Please add a semicolon at the end of your query.');
             return;
         }
         
@@ -753,4 +949,5 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('switchView function available:', typeof window.switchView);
     console.log('queryVisualizer available:', typeof window.queryVisualizer);
 });
+
 
