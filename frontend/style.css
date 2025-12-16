@@ -183,16 +183,18 @@ body {
 .link {
     fill: none;
     stroke: #999;
-    stroke-width: 2px;
+    stroke-width: 3px;
     cursor: pointer;
 }
 
 .link.fk {
     stroke: #3498db;
+    stroke-width: 3px;
 }
 
 .link.inferred {
     stroke: #e74c3c;
+    stroke-width: 3px;
     stroke-dasharray: 5,5;
 }
 
@@ -331,5 +333,82 @@ body {
     font-size: 11px;
     color: #666;
     margin-top: 5px;
+}
+
+.btn-simulate {
+    background: #9b59b6;
+    margin-right: 10px;
+    margin-bottom: 10px;
+    width: auto;
+    display: inline-block;
+}
+
+.btn-simulate:hover {
+    background: #8e44ad;
+}
+
+.risk-badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    margin-left: 10px;
+}
+
+.risk-badge.risk-high {
+    background: #e74c3c;
+    color: white;
+}
+
+.risk-badge.risk-medium {
+    background: #f39c12;
+    color: white;
+}
+
+.risk-badge.risk-low {
+    background: #f1c40f;
+    color: #333;
+}
+
+.simulation-result {
+    margin-top: 15px;
+    padding: 12px;
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.simulation-result h5 {
+    margin: 0 0 8px 0;
+    font-size: 14px;
+}
+
+.simulation-success {
+    background: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.simulation-failure {
+    background: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+.simulation-warning {
+    background: #fff3cd;
+    color: #856404;
+    border: 1px solid #ffeaa7;
+}
+
+.simulation-error {
+    background: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+.warning-text {
+    color: #856404;
+    font-weight: 500;
 }
 

@@ -37,20 +37,24 @@ class GraphBuilder:
         from_table: str,
         to_table: str,
         from_columns: List[str],
-        to_columns: List[str]
+        to_columns: List[str],
+        on_delete: str = 'RESTRICT',
+        on_update: str = 'RESTRICT'
     ):
-        """Add a foreign key edge to the graph"""
+        """Add a foreign key edge to the graph with constraint metadata"""
         if not self.graph.has_node(from_table):
             self.add_table(from_table, 'sql', [])
         if not self.graph.has_node(to_table):
             self.add_table(to_table, 'sql', [])
         
-        # Store edge data
+        # Store edge data with constraint information
         edge_data = {
             'kind': 'fk',
             'from_columns': from_columns,
             'to_columns': to_columns,
-            'confidence': 1.0
+            'confidence': 1.0,
+            'on_delete': on_delete.upper(),
+            'on_update': on_update.upper()
         }
         
         # NetworkX supports edge attributes
@@ -129,21 +133,31 @@ class GraphBuilder:
         
         for source, target, data in self.graph.edges(data=True):
             if source == table_name:
-                details['outgoing_edges'].append({
+                edge_info = {
                     'target': target,
                     'kind': data.get('kind', 'unknown'),
                     'from_columns': data.get('from_columns', []),
                     'to_columns': data.get('to_columns', []),
                     'confidence': data.get('confidence', 1.0)
-                })
+                }
+                if data.get('on_delete'):
+                    edge_info['on_delete'] = data.get('on_delete')
+                if data.get('on_update'):
+                    edge_info['on_update'] = data.get('on_update')
+                details['outgoing_edges'].append(edge_info)
             if target == table_name:
-                details['incoming_edges'].append({
+                edge_info = {
                     'source': source,
                     'kind': data.get('kind', 'unknown'),
                     'from_columns': data.get('from_columns', []),
                     'to_columns': data.get('to_columns', []),
                     'confidence': data.get('confidence', 1.0)
-                })
+                }
+                if data.get('on_delete'):
+                    edge_info['on_delete'] = data.get('on_delete')
+                if data.get('on_update'):
+                    edge_info['on_update'] = data.get('on_update')
+                details['incoming_edges'].append(edge_info)
         
         return details
     

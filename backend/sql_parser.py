@@ -42,14 +42,16 @@ class SQLParser:
             
             self.tables.append(table_info)
         
-        # Parse ALTER TABLE statements for foreign keys
-        alter_table_pattern = r'ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+(?:CONSTRAINT\s+`?\w+`?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)'
+        # Parse ALTER TABLE statements for foreign keys with constraints
+        alter_table_pattern = r'ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+(?:CONSTRAINT\s+`?\w+`?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)(?:\s+ON\s+DELETE\s+(\w+))?(?:\s+ON\s+UPDATE\s+(\w+))?'
         
         for match in re.finditer(alter_table_pattern, sql_content, re.IGNORECASE):
             table_name = match.group(1)
             fk_columns = [col.strip().strip('`') for col in match.group(2).split(',')]
             ref_table = match.group(3)
             ref_columns = [col.strip().strip('`') for col in match.group(4).split(',')]
+            on_delete = match.group(5) if match.group(5) else 'RESTRICT'
+            on_update = match.group(6) if match.group(6) else 'RESTRICT'
             
             # Find the table and add the foreign key
             for table in self.tables:
@@ -57,7 +59,9 @@ class SQLParser:
                     table['foreign_keys'].append({
                         'columns': fk_columns,
                         'references_table': ref_table,
-                        'referenced_columns': ref_columns
+                        'referenced_columns': ref_columns,
+                        'on_delete': on_delete.upper() if on_delete else 'RESTRICT',
+                        'on_update': on_update.upper() if on_update else 'RESTRICT'
                     })
                     break
         
@@ -84,9 +88,9 @@ class SQLParser:
             if not line:
                 continue
             
-            # Check for inline foreign key
+            # Check for inline foreign key with ON DELETE/ON UPDATE constraints
             fk_match = re.search(
-                r'FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)',
+                r'FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)(?:\s+ON\s+DELETE\s+(\w+))?(?:\s+ON\s+UPDATE\s+(\w+))?',
                 line,
                 re.IGNORECASE
             )
@@ -95,11 +99,15 @@ class SQLParser:
                 fk_columns = [col.strip().strip('`') for col in fk_match.group(1).split(',')]
                 ref_table = fk_match.group(2)
                 ref_columns = [col.strip().strip('`') for col in fk_match.group(3).split(',')]
+                on_delete = fk_match.group(4) if fk_match.group(4) else 'RESTRICT'
+                on_update = fk_match.group(5) if fk_match.group(5) else 'RESTRICT'
                 
                 table_info['foreign_keys'].append({
                     'columns': fk_columns,
                     'references_table': ref_table,
-                    'referenced_columns': ref_columns
+                    'referenced_columns': ref_columns,
+                    'on_delete': on_delete.upper() if on_delete else 'RESTRICT',
+                    'on_update': on_update.upper() if on_update else 'RESTRICT'
                 })
             else:
                 # Regular column definition

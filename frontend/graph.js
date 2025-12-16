@@ -38,31 +38,33 @@ function initializeGraph() {
     // Create arrow marker definitions
     const defs = svg.append('defs');
     
-    // Arrow for FK edges
+    // Arrow for FK edges - thinner arrowhead
     defs.append('marker')
         .attr('id', 'arrow-fk')
-        .attr('viewBox', '0 -5 10 10')
-        .attr('refX', 25)
+        .attr('viewBox', '0 -3 8 6')
+        .attr('refX', 6)
         .attr('refY', 0)
-        .attr('markerWidth', 6)
-        .attr('markerHeight', 6)
+        .attr('markerWidth', 8)
+        .attr('markerHeight', 8)
         .attr('orient', 'auto')
         .append('path')
-        .attr('d', 'M0,-5L10,0L0,5')
-        .attr('class', 'arrow fk');
+        .attr('d', 'M0,-3L8,0L0,3')
+        .attr('fill', '#3498db')
+        .attr('stroke', 'none');
 
-    // Arrow for inferred edges
+    // Arrow for inferred edges - thinner arrowhead
     defs.append('marker')
         .attr('id', 'arrow-inferred')
-        .attr('viewBox', '0 -5 10 10')
-        .attr('refX', 25)
+        .attr('viewBox', '0 -3 8 6')
+        .attr('refX', 6)
         .attr('refY', 0)
-        .attr('markerWidth', 6)
-        .attr('markerHeight', 6)
+        .attr('markerWidth', 8)
+        .attr('markerHeight', 8)
         .attr('orient', 'auto')
         .append('path')
-        .attr('d', 'M0,-5L10,0L0,5')
-        .attr('class', 'arrow inferred');
+        .attr('d', 'M0,-3L8,0L0,3')
+        .attr('fill', '#e74c3c')
+        .attr('stroke', 'none');
 
     // Store container reference globally
     window.graphContainer = container;
@@ -222,22 +224,47 @@ function renderGraph() {
         return true;
     });
 
-    // Create force simulation
-    simulation = d3.forceSimulation(graphData.nodes)
-        .force('link', d3.forceLink(visibleEdges).id(d => d.id).distance(100))
-        .force('charge', d3.forceManyBody().strength(-300))
-        .force('center', d3.forceCenter(window.innerWidth / 2 - 150, window.innerHeight / 2))
-        .force('collision', d3.forceCollide().radius(40));
+    // Calculate dynamic radius for each node based on text length
+    graphData.nodes.forEach(d => {
+        const textLength = d.id.length;
+        // Base radius of 30, add 3 pixels per character, max 70
+        d.radius = Math.min(30 + (textLength * 3), 70);
+    });
 
-    // Create links
+    // Calculate max radius for collision detection
+    const maxRadius = Math.max(...graphData.nodes.map(d => d.radius), 40);
+
+    // Ensure edges reference node objects, not strings
+    const nodeMap = new Map(graphData.nodes.map(d => [d.id, d]));
+    visibleEdges.forEach(edge => {
+        edge.source = typeof edge.source === 'string' ? nodeMap.get(edge.source) : edge.source;
+        edge.target = typeof edge.target === 'string' ? nodeMap.get(edge.target) : edge.target;
+    });
+
+    // Filter out edges with missing source or target
+    const validEdges = visibleEdges.filter(edge => edge.source && edge.target);
+
+    // Create force simulation with expanded layout and crossing minimization
+    // Use stronger repulsion and longer distances to reduce edge crossings
+    simulation = d3.forceSimulation(graphData.nodes)
+        .force('link', d3.forceLink(validEdges).id(d => d.id).distance(300).strength(0.15))
+        .force('charge', d3.forceManyBody().strength(-800))
+        .force('center', d3.forceCenter(window.innerWidth / 2 - 150, window.innerHeight / 2).strength(0.03))
+        .force('collision', d3.forceCollide().radius(d => d.radius + 50))
+        .alphaDecay(0.06)  // Slower decay = more time to find optimal positions
+        .velocityDecay(0.8)  // Higher velocity decay = more stable
+        .alpha(0.6);  // Higher initial alpha = more energy to spread out and minimize crossings
+
+    // Create links as curved paths to minimize visual crossings
     const link = container.append('g')
         .attr('class', 'links')
-        .selectAll('line')
-        .data(visibleEdges)
+        .selectAll('path')
+        .data(validEdges)
         .enter()
-        .append('line')
+        .append('path')
         .attr('class', d => `link ${d.kind}`)
         .attr('marker-end', d => d.kind === 'fk' ? 'url(#arrow-fk)' : 'url(#arrow-inferred)')
+        .attr('fill', 'none')
         .on('click', (event, d) => {
             event.stopPropagation();
             selectEdge(d);
@@ -269,20 +296,50 @@ function renderGraph() {
         .on('mouseout', hideTooltip);
 
     node.append('circle')
-        .attr('r', 20)
+        .attr('r', d => d.radius)
         .attr('fill', d => d.source === 'sql' ? '#3498db' : '#e74c3c');
 
     node.append('text')
         .text(d => d.id)
-        .attr('dy', 4);
+        .attr('dy', 4)
+        .attr('font-size', '12px')
+        .attr('text-anchor', 'middle')
+        .attr('fill', 'white')
+        .attr('font-weight', '500');
 
     // Update positions on simulation tick
     simulation.on('tick', () => {
-        link
-            .attr('x1', d => d.source.x)
-            .attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x)
-            .attr('y2', d => d.target.y);
+        link.attr('d', d => {
+            // Calculate edge start and end points on circle perimeters
+            const dx = d.target.x - d.source.x;
+            const dy = d.target.y - d.source.y;
+            const sourceRadius = d.source.radius || 30;
+            const targetRadius = d.target.radius || 30;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            
+            if (len === 0) return '';
+            
+            // Start point on source circle
+            const x1 = d.source.x + (dx / len) * sourceRadius;
+            const y1 = d.source.y + (dy / len) * sourceRadius;
+            
+            // End point on target circle
+            const x2 = d.target.x - (dx / len) * targetRadius;
+            const y2 = d.target.y - (dy / len) * targetRadius;
+            
+            // Calculate control point for quadratic curve
+            // Offset perpendicular to the line to create a smooth curve
+            const offset = Math.min(len * 0.3, 50); // Curve offset
+            const perpX = -dy / len * offset;
+            const perpY = dx / len * offset;
+            
+            // Control point (midpoint with perpendicular offset)
+            const midX = (x1 + x2) / 2 + perpX;
+            const midY = (y1 + y2) / 2 + perpY;
+            
+            // Create quadratic Bezier curve path
+            return `M ${x1} ${y1} Q ${midX} ${midY} ${x2} ${y2}`;
+        });
 
         node
             .attr('transform', d => `translate(${d.x},${d.y})`);
@@ -290,7 +347,7 @@ function renderGraph() {
 }
 
 function dragstarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
+    if (!event.active) simulation.alphaTarget(0.1).restart();
     d.fx = d.x;
     d.fy = d.y;
 }
@@ -342,15 +399,41 @@ async function showNodeDetails(node) {
     try {
         const response = await fetch(`${API_BASE}/table/${node.id}`);
         const details = await response.json();
+        
+        // Get delete risk score
+        let riskScore = null;
+        try {
+            const riskResponse = await fetch(`${API_BASE}/table/${node.id}/delete-risk`);
+            riskScore = await riskResponse.json();
+        } catch (e) {
+            console.error('Error loading risk score:', e);
+        }
 
         const panel = document.getElementById('detailsPanel');
         const content = document.getElementById('detailsContent');
 
+        const riskBadge = riskScore && riskScore.risk_level !== 'none' 
+            ? `<span class="risk-badge risk-${riskScore.risk_level}">${riskScore.risk_level.toUpperCase()} DELETE RISK</span>`
+            : '';
+
         content.innerHTML = `
-            <h3>${details.name}</h3>
+            <h3>${details.name} ${riskBadge}</h3>
             <div class="details-section">
                 <h4>Source</h4>
                 <p>${details.source}</p>
+            </div>
+            ${riskScore ? `
+            <div class="details-section">
+                <h4>Delete Risk Score</h4>
+                <p>Risk Level: <strong>${riskScore.risk_level.toUpperCase()}</strong> (${riskScore.risk_score}/100)</p>
+                <p class="stats">Incoming FKs: ${riskScore.incoming_fk_count} | RESTRICT: ${riskScore.restrict_count} | CASCADE: ${riskScore.cascade_count}</p>
+            </div>
+            ` : ''}
+            <div class="details-section">
+                <h4>Simulation</h4>
+                <button class="btn btn-simulate" onclick="simulateDelete('${details.name}')">Simulate DELETE</button>
+                <button class="btn btn-simulate" onclick="simulateUpdate('${details.name}')">Simulate UPDATE</button>
+                <div id="simulationResult-${details.name}"></div>
             </div>
             <div class="details-section">
                 <h4>Columns (${details.columns.length})</h4>
@@ -370,6 +453,8 @@ async function showNodeDetails(node) {
                         <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
                         <strong>${edge.target}</strong>
                         <p>${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
+                        ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
+                        ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
                     </div>
                 `).join('')}
             </div>
@@ -380,6 +465,9 @@ async function showNodeDetails(node) {
                         <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
                         <strong>${edge.source}</strong>
                         <p>${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
+                        ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
+                        ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
+                        ${edge.kind === 'inferred' ? `<p class="warning-text">⚠️ No referential constraint - deletion may break joins</p>` : ''}
                     </div>
                 `).join('')}
             </div>
@@ -413,7 +501,15 @@ async function showEdgeDetails(edge) {
                     <div class="edge-info">
                         <span class="kind ${e.kind}">${e.kind.toUpperCase()}</span>
                         <p><strong>Columns:</strong> ${e.from_columns.join(', ')} → ${e.to_columns.join(', ')}</p>
+                        ${e.on_delete ? `<p class="stats"><strong>ON DELETE:</strong> ${e.on_delete}</p>` : ''}
+                        ${e.on_update ? `<p class="stats"><strong>ON UPDATE:</strong> ${e.on_update}</p>` : ''}
                         ${e.confidence !== undefined ? `<p><strong>Confidence:</strong> ${(e.confidence * 100).toFixed(1)}%</p>` : ''}
+                        ${e.kind === 'inferred' ? `
+                            <div class="simulation-warning" style="margin-top: 10px; padding: 8px;">
+                                <strong>⚠️ Warning:</strong> This is an inferred relationship (not enforced by schema).
+                                <p style="margin: 5px 0 0 0;">Deletion/update operations may succeed but break logical joins.</p>
+                            </div>
+                        ` : ''}
                         ${e.stats ? `
                             <div class="stats">
                                 <p>Name Similarity: ${(e.stats.name_similarity * 100).toFixed(1)}%</p>

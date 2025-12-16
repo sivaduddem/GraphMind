@@ -2,16 +2,17 @@
 GraphMind FastAPI Backend
 Main application entry point
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from typing import Optional, List
+from typing import Optional, List, Dict
 import uvicorn
 from pathlib import Path
 
 from backend.graph_builder import GraphBuilder
 from backend.sql_parser import SQLParser
 from backend.csv_analyzer import CSVAnalyzer
+from backend.constraint_simulator import ConstraintSimulator
 
 app = FastAPI(title="GraphMind API", version="1.0.0")
 
@@ -49,6 +50,9 @@ async def upload_sql(file: UploadFile = File(...)):
         content = await file.read()
         sql_content = content.decode('utf-8')
         
+        # Clear existing graph before parsing new SQL file
+        graph_builder.clear()
+        
         parser = SQLParser()
         tables = parser.parse_sql(sql_content)
         
@@ -63,7 +67,9 @@ async def upload_sql(file: UploadFile = File(...)):
                     from_table=table['name'],
                     to_table=fk['references_table'],
                     from_columns=fk['columns'],
-                    to_columns=fk['referenced_columns']
+                    to_columns=fk['referenced_columns'],
+                    on_delete=fk.get('on_delete', 'RESTRICT'),
+                    on_update=fk.get('on_update', 'RESTRICT')
                 )
         
         return {
@@ -162,6 +168,49 @@ async def clear_graph():
     """Clear the entire graph"""
     graph_builder.clear()
     return {"status": "success", "message": "Graph cleared"}
+
+
+@app.post("/api/simulate/delete")
+async def simulate_delete(request: Dict = Body(...)):
+    """Simulate a DELETE operation on a table"""
+    try:
+        table_name = request.get('table')
+        if not table_name:
+            raise HTTPException(status_code=400, detail="Table name is required")
+        
+        simulator = ConstraintSimulator(graph_builder)
+        result = simulator.simulate_delete(table_name)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/simulate/update")
+async def simulate_update(request: Dict = Body(...)):
+    """Simulate an UPDATE operation on a table column"""
+    try:
+        table_name = request.get('table')
+        column = request.get('column')
+        
+        if not table_name:
+            raise HTTPException(status_code=400, detail="Table name is required")
+        
+        simulator = ConstraintSimulator(graph_builder)
+        result = simulator.simulate_update(table_name, column)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/table/{table_name}/delete-risk")
+async def get_delete_risk(table_name: str):
+    """Get delete risk score for a table"""
+    try:
+        simulator = ConstraintSimulator(graph_builder)
+        risk = simulator.get_delete_risk_score(table_name)
+        return risk
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # Serve frontend static files
