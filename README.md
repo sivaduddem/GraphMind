@@ -230,13 +230,6 @@ The `examples/` directory contains sample files:
 - **Centrality Metrics**: Degree, betweenness centrality for critical table detection
 - **Articulation Points**: Identify graph disconnection risks
 
-### Resume-Worthy Features
-- ✅ Implemented dependency blast-radius analysis using graph traversal
-- ✅ Applied graph theory (centrality metrics, articulation points) to identify critical database tables
-- ✅ Built join path finder using shortest path algorithms
-- ✅ Enhanced ML inference explainability with detailed confidence breakdowns
-- ✅ Developed constraint simulation system for database operation testing
-
 ## Limitations
 
 - SQL parser supports common MySQL DDL syntax but not all dialects
