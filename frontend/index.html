@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GraphMind - Data-to-Graph Explorer</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/sql/sql.min.js"></script>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -30,7 +34,8 @@
                 <div id="uploadStatus"></div>
             </div>
 
-            <div class="sidebar-section">
+            <!-- Graph View Controls -->
+            <div class="sidebar-section" id="graphControls">
                 <h2>Controls</h2>
                 <div class="checkbox-group">
                     <input type="checkbox" id="showFK" checked>
@@ -47,12 +52,36 @@
                 <button class="btn btn-secondary" onclick="clearGraph()">Clear Graph</button>
             </div>
 
-            <div class="sidebar-section">
+            <!-- Query Visualizer Controls -->
+            <div class="sidebar-section" id="queryControls" style="display: none;">
+                <h2>Query Visualizer</h2>
+                <div class="step-controls">
+                    <div class="step-info">
+                        <span id="currentLineInfo">Line 0 / 0</span>
+                    </div>
+                    <div class="step-buttons">
+                        <button class="btn btn-small" id="prevLineBtn" onclick="queryVisualizer.prevLine()">◀ Prev Line</button>
+                        <button class="btn btn-small" id="nextLineBtn" onclick="queryVisualizer.nextLine()">Next Line ▶</button>
+                    </div>
+                    <div class="playback-controls">
+                        <button class="btn btn-small" id="playBtn" onclick="queryVisualizer.play()">▶ Play</button>
+                        <button class="btn btn-small" id="pauseBtn" onclick="queryVisualizer.pause()" style="display: none;">⏸ Pause</button>
+                        <button class="btn btn-small" id="resetBtn" onclick="queryVisualizer.reset()">⏮ Reset</button>
+                    </div>
+                    <div class="speed-control">
+                        <label>Speed:</label>
+                        <input type="range" id="speedSlider" min="0.5" max="3" step="0.5" value="1" oninput="queryVisualizer.setSpeed(this.value)">
+                        <span id="speedValue">1x</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar-section" id="searchSection">
                 <h2>Search</h2>
                 <input type="text" id="searchBox" class="search-box" placeholder="Search tables...">
             </div>
 
-            <div class="sidebar-section">
+            <div class="sidebar-section" id="graphStatsSection">
                 <h2>Graph Stats</h2>
                 <div id="graphStats">
                     <p>Nodes: <span id="nodeCount">0</span></p>
@@ -61,16 +90,57 @@
             </div>
         </div>
 
-        <div class="graph-container">
-            <svg class="graph-svg" id="graphSvg"></svg>
-            <div class="tooltip" id="tooltip"></div>
-            <div class="details-panel" id="detailsPanel">
-                <div id="detailsContent"></div>
+        <div class="main-content">
+            <!-- View Switcher Tabs -->
+            <div class="view-switcher">
+                <button class="view-tab active" id="graphViewTab" onclick="if(window.switchView){window.switchView('graph');}else{console.error('switchView not found');}">Graph View</button>
+                <button class="view-tab" id="queryViewTab" onclick="if(window.switchView){window.switchView('query');}else{console.error('switchView not found');}">Query Visualizer</button>
+            </div>
+
+            <!-- Graph View -->
+            <div class="view-container" id="graphView">
+                <div class="graph-container">
+                    <svg class="graph-svg" id="graphSvg"></svg>
+                    <div class="tooltip" id="tooltip"></div>
+                    <div class="details-panel" id="detailsPanel">
+                        <div id="detailsContent"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Query Visualizer View -->
+            <div class="view-container" id="queryView" style="display: none;">
+                <div class="query-visualizer-container">
+                    <!-- SQL Editor Section -->
+                    <div class="sql-editor-section">
+                        <div class="editor-header">
+                            <h3>SQL Query</h3>
+                            <button class="btn btn-small" onclick="queryVisualizer.compileQuery()">Compile Query</button>
+                        </div>
+                        <textarea id="sqlEditor" class="sql-editor" placeholder="Enter your SQL query here..."></textarea>
+                    </div>
+
+                    <!-- Table Transformation Canvas -->
+                    <div class="transformation-canvas" id="transformationCanvas">
+                        <div class="canvas-placeholder">
+                            <p>Compile a query to see step-by-step transformations</p>
+                        </div>
+                    </div>
+
+                    <!-- Inspector Panel -->
+                    <div class="inspector-panel" id="inspectorPanel">
+                        <h3>Inspector</h3>
+                        <div id="inspectorContent">
+                            <p class="inspector-placeholder">Select a line to see details</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
     <script src="graph.js"></script>
+    <script src="query_visualizer.js"></script>
 </body>
 </html>
 

@@ -13,6 +13,7 @@ from backend.graph_builder import GraphBuilder
 from backend.sql_parser import SQLParser
 from backend.csv_analyzer import CSVAnalyzer
 from backend.constraint_simulator import ConstraintSimulator
+from backend.query_visualizer import QueryVisualizer
 
 app = FastAPI(title="GraphMind API", version="1.0.0")
 
@@ -27,6 +28,9 @@ app.add_middleware(
 
 # Global graph builder instance
 graph_builder = GraphBuilder()
+
+# Global query visualizer instance
+query_visualizer = QueryVisualizer(graph_builder)
 
 
 @app.get("/")
@@ -275,6 +279,132 @@ async def find_join_path(
     try:
         paths = graph_builder.find_join_paths(from_table, to_table, max_depth=max_depth)
         return paths
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/query/compile")
+async def compile_query(request: Dict = Body(...)):
+    """Compile a SQL query into semantic steps"""
+    try:
+        query_text = request.get('query')
+        query_id = request.get('query_id')
+        
+        if not query_text:
+            raise HTTPException(status_code=400, detail="Query text is required")
+        
+        result = query_visualizer.compile_query(query_text, query_id)
+        
+        # Convert steps to JSON-serializable format
+        serializable_result = {
+            'steps': [
+                {
+                    'type': step['type'],
+                    'description': step.get('description', ''),
+                    'line_range': step.get('line_range', (0, 0)),
+                    **{k: v for k, v in step.items() if k not in ['line_range'] and isinstance(v, (str, int, float, list, dict, type(None)))}
+                }
+                for step in result['steps']
+            ],
+            'sub_steps': result.get('sub_steps', []),  # Granular steps for frontend
+            'line_to_step': result['line_to_step'],
+            'line_count': result['line_count'],
+            'total_steps': result.get('total_steps', len(result['steps'])),
+            'total_sub_steps': result.get('total_sub_steps', len(result.get('sub_steps', []))),
+            'query_id': result['query_id']
+        }
+        
+        return serializable_result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/query/state")
+async def get_query_state(request: Dict = Body(...)):
+    """Get visual state for a specific line index"""
+    try:
+        query_id = request.get('query_id')
+        line_index = request.get('line_index', 0)
+        sub_step_index = request.get('sub_step_index')  # Optional granular step index
+        
+        if not query_id:
+            raise HTTPException(status_code=400, detail="Query ID is required")
+        
+        if not isinstance(line_index, int) or line_index < 0:
+            raise HTTPException(status_code=400, detail="Line index must be a non-negative integer")
+        
+        try:
+            state = query_visualizer.get_visual_state(query_id, line_index, sub_step_index)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Error getting visual state: {str(e)}")
+        
+        # Ensure explanation_text is never empty
+        explanation_text = state.get('explanation_text', '')
+        if not explanation_text or explanation_text.strip() == '':
+            explanation_text = 'Processing query step...'
+        
+        # Ensure all data is JSON-serializable (clean NaN values)
+        def clean_for_json(obj):
+            """Recursively clean NaN, inf, and -inf values from data structures"""
+            import math
+            import pandas as pd
+            import numpy as np
+            
+            if isinstance(obj, dict):
+                return {k: clean_for_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_for_json(item) for item in obj]
+            elif isinstance(obj, (float, np.floating)):
+                if pd.isna(obj) or math.isnan(obj):
+                    return None
+                elif math.isinf(obj):
+                    return None
+                else:
+                    return obj
+            else:
+                return obj
+        
+        serializable_state = {
+            'input_tables': clean_for_json(state.get('input_tables', [])),
+            'output_table': clean_for_json(state.get('output_table')),
+            'highlighted_cols': state.get('highlighted_cols', []),
+            'dimmed_rows': state.get('dimmed_rows', []),
+            'annotations': clean_for_json(state.get('annotations', {})),
+            'explanation_text': explanation_text,
+            'step_type': state.get('step_type', ''),
+            'before_row_count': state.get('before_row_count', 0),
+            'after_row_count': state.get('after_row_count', 0),
+            'join_condition': clean_for_json(state.get('join_condition'))
+        }
+        
+        return serializable_state
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_detail = str(e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {error_detail}")
+
+
+@app.get("/api/query/datasets")
+async def get_available_datasets():
+    """Get list of available tables/datasets"""
+    try:
+        tables = []
+        for table_name in graph_builder.table_rows.keys():
+            table_details = graph_builder.get_table_details(table_name)
+            if table_details:
+                row_count = len(graph_builder.get_table_rows(table_name))
+                tables.append({
+                    'name': table_name,
+                    'source': table_details.get('source', 'unknown'),
+                    'column_count': len(table_details.get('columns', [])),
+                    'row_count': row_count
+                })
+        return {'tables': tables}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

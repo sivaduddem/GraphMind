@@ -160,6 +160,10 @@ async function uploadSQLFile(file) {
         if (response.ok) {
             showStatus(`Successfully parsed ${result.tables_parsed} tables`, 'success');
             loadGraph();
+            // Reload datasets in query visualizer if it exists
+            if (window.queryVisualizer && typeof window.queryVisualizer.loadDatasets === 'function') {
+                window.queryVisualizer.loadDatasets();
+            }
         } else {
             showStatus(`Error: ${result.detail}`, 'error');
         }
@@ -187,6 +191,10 @@ async function uploadCSVFile(file) {
                 'success'
             );
             loadGraph();
+            // Reload datasets in query visualizer if it exists
+            if (window.queryVisualizer && typeof window.queryVisualizer.loadDatasets === 'function') {
+                window.queryVisualizer.loadDatasets();
+            }
         } else {
             showStatus(`Error: ${result.detail}`, 'error');
         }
