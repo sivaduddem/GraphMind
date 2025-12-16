@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GraphMind - Data-to-Graph Explorer</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h1>GraphMind</h1>
+                <p>Data-to-Graph Explorer</p>
+            </div>
+
+            <div class="sidebar-section">
+                <h2>Upload Data</h2>
+                <div class="upload-area" id="sqlUploadArea">
+                    <p>📄 SQL Schema</p>
+                    <input type="file" id="sqlFile" accept=".sql">
+                    <button class="btn" onclick="document.getElementById('sqlFile').click()">Choose SQL File</button>
+                </div>
+                <div class="upload-area" id="csvUploadArea">
+                    <p>📊 CSV Data</p>
+                    <input type="file" id="csvFile" accept=".csv">
+                    <button class="btn" onclick="document.getElementById('csvFile').click()">Choose CSV File</button>
+                </div>
+                <div id="uploadStatus"></div>
+            </div>
+
+            <div class="sidebar-section">
+                <h2>Controls</h2>
+                <div class="control-group">
+                    <label>Confidence Threshold</label>
+                    <input type="range" id="confidenceSlider" class="slider" min="0" max="1" step="0.1" value="0">
+                    <span id="confidenceValue">0.0</span>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="showFK" checked>
+                    <label for="showFK">Show Foreign Keys</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="showInferred" checked>
+                    <label for="showInferred">Show Inferred</label>
+                </div>
+                <button class="btn btn-secondary" onclick="clearGraph()">Clear Graph</button>
+            </div>
+
+            <div class="sidebar-section">
+                <h2>Search</h2>
+                <input type="text" id="searchBox" class="search-box" placeholder="Search tables...">
+            </div>
+
+            <div class="sidebar-section">
+                <h2>Graph Stats</h2>
+                <div id="graphStats">
+                    <p>Nodes: <span id="nodeCount">0</span></p>
+                    <p>Edges: <span id="edgeCount">0</span></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="graph-container">
+            <svg class="graph-svg" id="graphSvg"></svg>
+            <div class="tooltip" id="tooltip"></div>
+            <div class="details-panel" id="detailsPanel">
+                <button class="close-btn" onclick="closeDetailsPanel()">×</button>
+                <div id="detailsContent"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="graph.js"></script>
+</body>
+</html>
+

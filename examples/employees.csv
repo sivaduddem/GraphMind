@@ -1,0 +1,9 @@
+id,name,email,department_id,manager_id,hire_date
+1,John Doe,john.doe@example.com,1,3,2020-01-15
+2,Jane Smith,jane.smith@example.com,1,3,2020-03-20
+3,Bob Johnson,bob.johnson@example.com,2,NULL,2019-06-10
+4,Alice Williams,alice.williams@example.com,2,3,2021-02-14
+5,Charlie Brown,charlie.brown@example.com,1,3,2020-11-05
+6,Diana Prince,diana.prince@example.com,3,3,2021-07-22
+7,Edward Norton,edward.norton@example.com,4,NULL,2019-09-30
+
