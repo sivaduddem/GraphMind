@@ -13,6 +13,36 @@
   - **Inferred edges**: Relationships detected through data pattern analysis (red, dashed)
 - **Confidence Scoring**: Inferred relationships include confidence scores (0-1) with detailed statistics
 
+### 🔍 SQL Query Visualizer
+- **Step-by-Step Query Execution**: Visualize SQL queries step-by-step with intermediate table states
+- **Supported SQL Operations**:
+  - **FROM**: Load tables and display initial data
+  - **JOIN**: Visualize table joins (INNER, LEFT, RIGHT, FULL) with input/output tables
+  - **WHERE**: Filter rows with conditions including:
+    - LIKE / NOT LIKE pattern matching (`%` and `_` wildcards)
+    - Comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
+    - IS NULL / IS NOT NULL
+    - AND / OR logical operators
+    - IN subqueries
+  - **SELECT**: Column projection with incremental column selection visualization
+  - **GROUP BY**: Group rows by columns
+  - **HAVING**: Filter groups with aggregate conditions
+  - **UNION**: Combine results from multiple queries
+- **Interactive Navigation**:
+  - Step forward/backward through query execution
+  - Play/pause automatic playback
+  - Adjustable playback speed (0.5x to 3x)
+  - Reset to beginning
+- **Visual Features**:
+  - **Input/Output Tables**: See table state before and after each operation
+  - **Row Count Tracking**: Before/after row counts for each step
+  - **Column Highlighting**: Highlighted columns relevant to current operation
+  - **Dimmed Rows**: Visual indication of filtered-out rows
+  - **Inspector Panel**: Detailed explanation of each step, step type, and statistics
+  - **Code Editor**: Syntax-highlighted SQL editor with active line highlighting
+- **Granular Stepping**: Break down SELECT clauses into individual column selections for detailed visualization
+- **Real-time Execution**: Execute queries against uploaded data and see actual results
+
 ### 🔥 Advanced Graph Analytics
 
 #### A. Impact / Blast Radius Analysis
@@ -71,9 +101,15 @@
   - Critical table detection (centrality metrics, articulation points)
   - Join path finding (shortest path algorithms)
 - **Constraint Simulator** (`backend/constraint_simulator.py`): Simulates DELETE/UPDATE operations
-- **API Endpoints**: Upload files, retrieve graph data, analytics, and simulations
+- **Query Visualizer** (`backend/query_visualizer.py`): 
+  - Parses SQL queries into semantic steps
+  - Executes queries step-by-step using pandas
+  - Handles complex WHERE conditions (LIKE, NOT LIKE, AND, OR, IN subqueries)
+  - Supports JOINs, GROUP BY, HAVING, UNION operations
+  - Generates visual states for each execution step
+- **API Endpoints**: Upload files, retrieve graph data, analytics, simulations, and query visualization
 
-### Frontend (D3.js)
+### Frontend (D3.js + CodeMirror)
 - **Interactive Visualization**: Force-directed graph layout with D3.js
 - **Controls**: Toggle FK/inferred edges, critical tables toggle, search functionality
 - **Tree Layout**: Hierarchical tree visualization for impact analysis using D3 tree layout
@@ -85,6 +121,11 @@
 - **Visual Highlighting**: Dynamic highlighting for impacts, paths, and critical tables
 - **Data Table**: View and select rows for simulation operations
 - **View Management**: Seamless switching between full graph and focused impact tree views
+- **Query Visualizer**: 
+  - CodeMirror-based SQL editor with syntax highlighting
+  - Step-by-step query execution visualization
+  - Interactive table displays with transformation tracking
+  - Inspector panel with detailed step information
 
 ## Installation
 
@@ -173,6 +214,30 @@ The API will be available at `http://localhost:8000`
    - Cascade effects
    - Inferred relationship risks
 
+#### SQL Query Visualizer
+1. Switch to the "Query Visualizer" tab
+2. Upload your SQL schema and/or CSV data first (required for query execution)
+3. Enter a SQL query in the editor (e.g., `SELECT cid, company FROM customer WHERE cid LIKE "%bank%"`)
+4. Click "Compile Query" to parse and prepare the query
+5. Navigate through steps:
+   - Use "Next Line" / "Prev Line" buttons to step through manually
+   - Use "Play" button for automatic playback
+   - Adjust speed slider for playback speed
+   - Use "Reset" to return to the beginning
+6. View transformations:
+   - See input tables before each operation
+   - See output tables after each operation
+   - Check row counts (before → after) in the Inspector panel
+   - View highlighted columns relevant to the current step
+   - Read explanations of what each step does
+7. Supported query features:
+   - **Simple SELECT**: `SELECT col1, col2 FROM table`
+   - **WHERE filtering**: `SELECT * FROM table WHERE col LIKE "%pattern%" AND col2 > 100`
+   - **JOINs**: `SELECT * FROM table1 JOIN table2 ON table1.id = table2.id`
+   - **GROUP BY / HAVING**: `SELECT col, COUNT(*) FROM table GROUP BY col HAVING COUNT(*) > 5`
+   - **UNION**: `SELECT col FROM table1 UNION SELECT col FROM table2`
+   - **Subqueries**: `SELECT * FROM table WHERE col IN (SELECT col FROM other_table)`
+
 ## Graph Model
 
 ### Nodes (Tables)
@@ -213,6 +278,16 @@ The API will be available at `http://localhost:8000`
 - `POST /api/simulate/update` - Simulate UPDATE operation
   - Body: `{"table": "table_name", "column": "col_name", "row_identifiers": [...], "new_value": "value"}`
 
+### Query Visualizer Endpoints
+- `POST /api/query/compile` - Compile SQL query into semantic steps
+  - Body: `{"query": "SELECT ... FROM ... WHERE ..."}`
+  - Returns: Query ID, steps, line mappings, and sub-steps
+- `POST /api/query/state` - Get visual state for a specific query step
+  - Body: `{"query_id": "...", "line_index": 0, "sub_step_index": 0}`
+  - Returns: Input tables, output table, highlighted columns, explanations, row counts
+- `GET /api/query/datasets` - Get list of available tables/datasets
+  - Returns: List of tables with row counts and column information
+
 ## Example Files
 
 The `examples/` directory contains sample files:
@@ -235,7 +310,13 @@ The `examples/` directory contains sample files:
 - SQL parser supports common MySQL DDL syntax but not all dialects
 - CSV relationship inference uses heuristics (name similarity, profile matching) rather than actual data overlap
 - No real-time database synchronization
-- No query-level lineage tracking
+- Query Visualizer supports common SQL operations but may not handle all edge cases:
+  - Complex nested subqueries
+  - Window functions
+  - CTEs (Common Table Expressions)
+  - Some database-specific functions
+- LIKE pattern matching supports `%` (any sequence) and `_` (single character) wildcards
+- Query execution uses pandas DataFrames, so very large datasets may have performance limitations
 
 ## Project Structure
 
@@ -243,21 +324,24 @@ The `examples/` directory contains sample files:
 GraphMind/
 ├── backend/
 │   ├── __init__.py
-│   ├── main.py           # FastAPI application
-│   ├── sql_parser.py     # MySQL DDL parser
-│   ├── csv_analyzer.py   # CSV relationship inference
-│   └── graph_builder.py  # NetworkX graph management
+│   ├── main.py              # FastAPI application
+│   ├── sql_parser.py        # MySQL DDL parser
+│   ├── csv_analyzer.py      # CSV relationship inference
+│   ├── graph_builder.py    # NetworkX graph management
+│   ├── constraint_simulator.py  # DELETE/UPDATE simulation
+│   └── query_visualizer.py # SQL query step-by-step execution
 ├── frontend/
-│   ├── index.html        # Main UI
-│   ├── graph.js          # D3.js visualization
-│   └── style.css         # Styling
+│   ├── index.html           # Main UI
+│   ├── graph.js             # D3.js graph visualization
+│   ├── query_visualizer.js  # Query visualizer frontend logic
+│   └── style.css            # Styling
 ├── examples/
-│   ├── sample_schema.sql # Example SQL file
-│   └── *.csv             # Example CSV files
-├── requirements.txt      # Python dependencies
-├── run.py               # Startup script
-├── README.md            # This file
-└── QUICKSTART.md        # Quick start guide
+│   ├── sample_schema.sql    # Example SQL file
+│   └── *.csv                # Example CSV files
+├── requirements.txt         # Python dependencies
+├── run.py                  # Startup script
+├── README.md               # This file
+└── QUICKSTART.md           # Quick start guide
 ```
 
 ## License
