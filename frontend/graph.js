@@ -382,21 +382,6 @@ function dragended(event, d) {
 }
 
 function selectNode(node) {
-    // Restore full graph if impact view is active
-    if (impactViewActive) {
-        // Store node info before restoring
-        const nodeId = node.id || (typeof node === 'string' ? node : null);
-        restoreFullGraph();
-        
-        // After restore, we need to wait for graph to render, then select
-        // The restoreFullGraph will handle the selection via setTimeout
-        if (nodeId) {
-            // Update selectedNode reference so restoreFullGraph can use it
-            selectedNode = { id: nodeId };
-        }
-        return;
-    }
-    
     // Ensure node is an object with id property
     const nodeObj = typeof node === 'string' 
         ? graphData.nodes.find(n => n.id === node) || { id: node }
@@ -405,8 +390,10 @@ function selectNode(node) {
     selectedNode = nodeObj;
     selectedEdge = null;
 
-    // Clear all visualizations
-    clearAllHighlights();
+    // Clear all visualizations (but keep impact view active)
+    if (!impactViewActive) {
+        clearAllHighlights();
+    }
 
     // Update visual selection
     window.graphContainer.selectAll('.node').classed('selected', false);
@@ -455,10 +442,29 @@ function selectEdge(edge) {
     showEdgeDetails(edge);
 }
 
+async function getMaxDepth(tableName) {
+    // Get actual max depth by calling impact API with max depth
+    try {
+        const response = await fetch(`${API_BASE}/table/${tableName}/impact?depth=10`);
+        const impact = await response.json();
+        if (impact.paths && impact.paths.length > 0) {
+            const maxHops = Math.max(...impact.paths.map(p => p.hops || 0));
+            return maxHops + 1; // hops + 1 = depth
+        }
+        return 1; // No relationships
+    } catch (e) {
+        console.error('Error getting max depth:', e);
+        return 10; // Default fallback
+    }
+}
+
 async function showNodeDetails(node) {
     try {
         const response = await fetch(`${API_BASE}/table/${node.id}`);
         const details = await response.json();
+        
+        // Get actual max depth for this table
+        const actualMaxDepth = await getMaxDepth(node.id);
         
         // Get all tables for path finder dropdown
         let allTables = [];
@@ -502,22 +508,39 @@ async function showNodeDetails(node) {
             col.name.toLowerCase().endsWith('id')
         ) || details.columns[0];
 
+        // Add "View Full Graph" button at top if in impact view
+        const impactViewButton = impactViewActive 
+            ? `<div style="margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #e0e0e0;">
+                <button class="btn btn-secondary" onclick="restoreFullGraph()" style="width: 100%; font-size: 13px; padding: 8px;">View Full Graph</button>
+               </div>`
+            : '';
+
         content.innerHTML = `
-            <h3>${details.name} ${riskBadge}</h3>
-            <div class="details-section">
-                <h4>Source</h4>
-                <p>${details.source}</p>
+            <div class="panel-header">
+                <button class="close-btn" onclick="closeDetailsPanel()">×</button>
+                ${impactViewButton}
+                <h3>${details.name} ${riskBadge}</h3>
             </div>
-            ${riskScore ? `
-            <div class="details-section">
-                <h4>Delete Risk Score</h4>
-                <p>Risk Level: <strong>${riskScore.risk_level.toUpperCase()}</strong> (${riskScore.risk_score}/100)</p>
-                <p class="stats">Incoming FKs: ${riskScore.incoming_fk_count} | RESTRICT: ${riskScore.restrict_count} | CASCADE: ${riskScore.cascade_count}</p>
-            </div>
-            ` : ''}
+            <div class="panel-content">
+                <div class="info-card">
+                    <div class="info-row">
+                        <span class="info-label">Source:</span>
+                        <span class="info-value">${details.source}</span>
+                    </div>
+                    ${riskScore ? `
+                    <div class="info-row">
+                        <span class="info-label">Risk Level:</span>
+                        <span class="info-value risk-${riskScore.risk_level}">${riskScore.risk_level.toUpperCase()} (${riskScore.risk_score}/100)</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Incoming FKs:</span>
+                        <span class="info-value">${riskScore.incoming_fk_count} (RESTRICT: ${riskScore.restrict_count}, CASCADE: ${riskScore.cascade_count})</span>
+                    </div>
+                    ` : ''}
+                </div>
             ${tableData && tableData.rows && tableData.rows.length > 0 ? `
-            <div class="details-section">
-                <h4>Table Data (${tableData.rows.length} rows)</h4>
+            <div class="details-section" style="margin-top: 0;">
+                <h4 style="margin-top: 0; margin-bottom: 16px;">Table Data (${tableData.rows.length} rows)</h4>
                 <div class="data-table-container">
                     <table class="data-table">
                         <thead>
@@ -537,70 +560,82 @@ async function showNodeDetails(node) {
                         </tbody>
                     </table>
                 </div>
+                <div class="simulation-controls" style="margin-top: 12px;">
+                    <button class="btn btn-simulate" onclick="openDeleteSimulation('${details.name}')">Simulate DELETE</button>
+                    <button class="btn btn-simulate" onclick="openUpdateSimulation('${details.name}')">Simulate UPDATE</button>
+                </div>
+                <div id="simulationResult-${details.name}" style="margin-top: 12px;"></div>
             </div>
             ` : ''}
             <div class="details-section">
                 <h4>Impact Analysis</h4>
                 <div class="impact-controls">
-                    <button class="btn btn-impact" onclick="showDownstreamImpact('${details.name}')">Show Downstream Impact</button>
-                    <label>Depth: <input type="number" id="impactDepth-${details.name}" value="3" min="1" max="10" style="width: 50px;"></label>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <button class="btn btn-impact" onclick="showDownstreamImpact('${details.name}')">Show Downstream Impact</button>
+                        <label id="depthLabel-${details.name}" style="display: flex; align-items: center; font-size: 12px; color: #666; margin: 0; white-space: nowrap;">Depth (max ${actualMaxDepth}): <input type="number" id="impactDepth-${details.name}" value="${Math.min(3, actualMaxDepth)}" min="1" max="${actualMaxDepth}" style="width: 50px; margin-left: 5px; padding: 4px;"></label>
+                    </div>
                 </div>
-                <div id="impactResult-${details.name}"></div>
-            </div>
-            <div class="details-section">
-                <h4>Simulation</h4>
-                <div class="simulation-controls">
-                    <button class="btn btn-simulate" onclick="openDeleteSimulation('${details.name}')">Simulate DELETE</button>
-                    <button class="btn btn-simulate" onclick="openUpdateSimulation('${details.name}')">Simulate UPDATE</button>
-                </div>
-                <div id="simulationResult-${details.name}"></div>
+                <div id="impactResult-${details.name}" style="margin-top: 12px;"></div>
             </div>
             <div class="details-section">
                 <h4>Join Path Finder</h4>
                 <div class="path-finder-controls">
-                    <select id="pathTarget-${details.name}" class="form-control" style="margin-bottom: 5px;">
+                    <select id="pathTarget-${details.name}" class="form-control" style="margin-bottom: 8px;">
                         <option value="">Select target table...</option>
                         ${allTables.map(t => `<option value="${t}">${t}</option>`).join('')}
                     </select>
                     <button class="btn btn-path" onclick="findJoinPath('${details.name}')">Find Path</button>
                 </div>
-                <div id="pathResult-${details.name}"></div>
+                <div id="pathResult-${details.name}" style="margin-top: 12px;"></div>
             </div>
             <div class="details-section">
                 <h4>Columns (${details.columns.length})</h4>
                 <ul class="column-list">
                     ${details.columns.map(col => `
                         <li>
-                            <strong>${col.name}</strong> (${col.type || 'unknown'})
+                            <strong>${col.name}</strong> <span style="color: #999; font-size: 11px;">(${col.type || 'unknown'})</span>
                             ${col.distinct_count !== undefined ? `<span class="stats">${col.distinct_count} distinct</span>` : ''}
                         </li>
                     `).join('')}
                 </ul>
             </div>
+            ${details.outgoing_edges.length > 0 ? `
             <div class="details-section">
                 <h4>Outgoing Relationships (${details.outgoing_edges.length})</h4>
-                ${details.outgoing_edges.map(edge => `
-                    <div class="edge-info">
-                        <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
-                        <strong>${edge.target}</strong>
-                        <p>${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
-                        ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
-                        ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
-                    </div>
-                `).join('')}
+                <div class="scrollable-content">
+                    ${details.outgoing_edges.map(edge => `
+                        <div class="edge-info">
+                            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                                <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
+                                <strong style="margin-left: 8px;">${edge.target}</strong>
+                            </div>
+                            <p style="margin: 4px 0; font-size: 11px; color: #666;">${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
+                            ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
+                            ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
+                        </div>
+                    `).join('')}
+                </div>
             </div>
+            ` : ''}
+            ${details.incoming_edges.length > 0 ? `
             <div class="details-section">
                 <h4>Incoming Relationships (${details.incoming_edges.length})</h4>
-                ${details.incoming_edges.map(edge => `
-                    <div class="edge-info">
-                        <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
-                        <strong>${edge.source}</strong>
-                        <p>${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
-                        ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
-                        ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
-                        ${edge.kind === 'inferred' ? `<p class="warning-text">⚠️ No referential constraint - deletion may break joins</p>` : ''}
-                    </div>
-                `).join('')}
+                <div class="scrollable-content">
+                    ${details.incoming_edges.map(edge => `
+                        <div class="edge-info">
+                            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                                <span class="kind ${edge.kind}">${edge.kind.toUpperCase()}</span>
+                                <strong style="margin-left: 8px;">${edge.source}</strong>
+                            </div>
+                            <p style="margin: 4px 0; font-size: 11px; color: #666;">${edge.from_columns.join(', ')} → ${edge.to_columns.join(', ')}</p>
+                            ${edge.on_delete ? `<p class="stats">ON DELETE: ${edge.on_delete}</p>` : ''}
+                            ${edge.on_update ? `<p class="stats">ON UPDATE: ${edge.on_update}</p>` : ''}
+                            ${edge.kind === 'inferred' ? `<p class="warning-text">⚠️ No referential constraint - deletion may break joins</p>` : ''}
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+            ` : ''}
             </div>
         `;
 
@@ -696,6 +731,23 @@ function closeDetailsPanel() {
     clearAllHighlights();
     window.graphContainer.selectAll('.node').classed('selected', false);
     window.graphContainer.selectAll('.link').classed('selected', false);
+}
+
+function toggleSection(header) {
+    const section = header.closest('.details-section');
+    const content = section.querySelector('.details-section-content');
+    const isCollapsed = content.classList.contains('collapsed');
+    
+    if (isCollapsed) {
+        content.classList.remove('collapsed');
+        header.classList.remove('collapsed');
+        // Set max-height to actual content height
+        content.style.maxHeight = content.scrollHeight + 'px';
+    } else {
+        content.classList.add('collapsed');
+        header.classList.add('collapsed');
+        content.style.maxHeight = '0';
+    }
 }
 
 function getNodeTooltip(node) {
@@ -914,9 +966,31 @@ async function showDownstreamImpact(tableName) {
             return;
         }
         
+        // Calculate actual max depth from paths
+        let actualMaxDepth = depth;
+        if (impact.paths && impact.paths.length > 0) {
+            const maxHops = Math.max(...impact.paths.map(p => p.hops || 0));
+            actualMaxDepth = maxHops + 1; // hops + 1 = depth
+        }
+        
+        // Update depth input to reflect actual max depth
+        const depthInput = document.getElementById(`impactDepth-${tableName}`);
+        const depthLabel = document.getElementById(`depthLabel-${tableName}`);
+        if (depthInput && depthLabel) {
+            depthInput.max = actualMaxDepth;
+            const currentValue = parseInt(depthInput.value) || depth;
+            depthInput.value = Math.min(currentValue, actualMaxDepth);
+            
+            // Update label text to show actual range
+            depthLabel.innerHTML = `Depth (max ${actualMaxDepth}): <input type="number" id="impactDepth-${tableName}" value="${Math.min(currentValue, actualMaxDepth)}" min="1" max="${actualMaxDepth}" style="width: 50px; margin-left: 5px; padding: 4px;">`;
+        }
+        
         let html = '<div class="impact-result">';
         html += `<p class="success-text">📊 Impact Analysis (Depth: ${depth})</p>`;
         html += `<p><strong>${impact.impact_count}</strong> downstream table(s) would be affected</p>`;
+        if (actualMaxDepth < depth) {
+            html += `<p class="stats" style="font-size: 11px; color: #666;">Note: Actual impact depth is ${actualMaxDepth} (requested depth ${depth} exceeds available relationships)</p>`;
+        }
         
         if (impact.impacted_tables && impact.impacted_tables.length > 0) {
             html += '<div class="impacted-tables">';
@@ -953,6 +1027,20 @@ function renderImpactSubgraph(sourceTable, impact, depth) {
     if (!impactViewActive) {
         originalGraphData = JSON.parse(JSON.stringify(graphData));
         impactViewActive = true;
+        
+        // Add floating "View Full Graph" button
+        const graphContainer = document.querySelector('.graph-container');
+        let floatingButton = document.getElementById('viewFullGraphButton');
+        if (!floatingButton) {
+            floatingButton = document.createElement('button');
+            floatingButton.id = 'viewFullGraphButton';
+            floatingButton.className = 'btn btn-secondary';
+            floatingButton.textContent = 'View Full Graph';
+            floatingButton.style.cssText = 'position: absolute; top: 20px; left: 20px; z-index: 1000; padding: 8px 16px; font-size: 12px; width: auto; display: inline-block;';
+            floatingButton.onclick = restoreFullGraph;
+            graphContainer.appendChild(floatingButton);
+        }
+        floatingButton.style.display = 'block';
     }
     
     // Build impact subgraph: source table + all impacted tables
@@ -1118,8 +1206,18 @@ function renderTreeLayout(treeData, sourceTable) {
             return Math.min(30 + (textLength * 3), 70);
         })
         .attr('fill', '#3498db')  // Uniform blue for all nodes
-        .attr('stroke', '#2c3e50')  // Dark gray border for all nodes
-        .attr('stroke-width', 2);  // Uniform stroke width
+        .attr('stroke', d => {
+            // Apply orange border for impacted nodes, red for impact source
+            if (d.data.id === sourceTable) {
+                return '#e74c3c';  // Red for impact source
+            } else {
+                return '#f39c12';  // Orange for impacted nodes
+            }
+        })
+        .attr('stroke-width', d => {
+            // Thicker border for impact source
+            return d.data.id === sourceTable ? 5 : 4;
+        });
     
     // Add labels
     node.append('text')
@@ -1139,6 +1237,12 @@ function renderTreeLayout(treeData, sourceTable) {
 
 function restoreFullGraph() {
     impactViewActive = false;
+    
+    // Hide floating "View Full Graph" button
+    const floatingButton = document.getElementById('viewFullGraphButton');
+    if (floatingButton) {
+        floatingButton.style.display = 'none';
+    }
     
     // Stop any existing simulation (from tree layout)
     if (simulation) {
