@@ -280,7 +280,16 @@ window.queryVisualizer = {
             this.compiledQuery = result;
             this.currentQueryId = result.query_id;
             this.totalLines = result.line_count;
-            this.totalSteps = result.total_steps || result.line_count;  // Use sub-steps if available
+            
+            // Set up sub-steps if available
+            if (result.sub_steps && result.sub_steps.length > 0) {
+                this.subSteps = result.sub_steps;
+                this.totalSteps = result.total_sub_steps || result.sub_steps.length;
+            } else {
+                this.subSteps = [];
+                this.totalSteps = result.total_steps || result.line_count;
+            }
+            
             this.currentLineIndex = 0;
             this.currentStepIndex = 0;  // Track granular step index
             this.visualStates = {};
@@ -289,7 +298,7 @@ window.queryVisualizer = {
             this.updateLineInfo();
             
             // Load initial state (use sub_step_index if available)
-            if (result.sub_steps && result.sub_steps.length > 0) {
+            if (this.subSteps && this.subSteps.length > 0) {
                 await this.loadVisualState(0, 0);  // Pass sub_step_index 0
             } else {
                 await this.loadVisualState(0);
@@ -411,14 +420,16 @@ window.queryVisualizer = {
             
             // Render output table - always show result if available
             if (state.output_table) {
-                const outputTitle = state.step_type === 'SELECT' ? 'Final Result' : 
+                const outputTitle = state.step_type === 'SELECT' || state.step_type === 'SELECT_COL' ? 'Final Result' : 
                                    state.step_type === 'WHERE' ? 'Filtered Result' :
                                    state.step_type === 'FROM' ? 'Loaded Table' :
                                    'Query Result';
                 canvasHTML += this.renderTable(state.output_table, 'output', outputTitle, state.highlighted_cols, state.dimmed_rows);
             } else if (state.input_tables && state.input_tables.length > 0) {
-                // Show first input table as output if no output yet
-                canvasHTML += this.renderTable(state.input_tables[0], 'output', 'Current State', state.highlighted_cols, state.dimmed_rows);
+                // For SELECT_COL steps, we should always have an output_table, but if not, show input as fallback
+                // For other steps, show first input table as output if no output yet
+                const fallbackTitle = state.step_type === 'SELECT_COL' ? 'Current State (before projection)' : 'Current State';
+                canvasHTML += this.renderTable(state.input_tables[0], 'output', fallbackTitle, state.highlighted_cols, state.dimmed_rows);
             } else {
                 // Only show placeholder if truly no data
                 canvasHTML = '<div class="canvas-placeholder"><p>No data to display</p></div>';
@@ -541,7 +552,7 @@ window.queryVisualizer = {
     updateLineInfo() {
         const infoElement = document.getElementById('currentLineInfo');
         if (infoElement) {
-            if (this.compiledQuery && this.compiledQuery.sub_steps) {
+            if (this.subSteps && this.subSteps.length > 0) {
                 infoElement.textContent = `Step ${this.currentStepIndex + 1} / ${this.totalSteps}`;
             } else {
                 infoElement.textContent = `Line ${this.currentLineIndex + 1} / ${this.totalLines}`;
@@ -628,7 +639,7 @@ window.queryVisualizer = {
         const delay = baseDelay * speedMultiplier;
         
         this.playInterval = setInterval(() => {
-            if (this.compiledQuery && this.compiledQuery.sub_steps) {
+            if (this.subSteps && this.subSteps.length > 0) {
                 if (this.currentStepIndex < this.totalSteps - 1) {
                     this.nextLine();
                 } else {
@@ -658,8 +669,13 @@ window.queryVisualizer = {
     reset() {
         this.pause();
         this.currentLineIndex = 0;
+        this.currentStepIndex = 0;
         this.updateLineInfo();
-        this.loadVisualState(0);
+        if (this.subSteps && this.subSteps.length > 0) {
+            this.loadVisualState(0, 0);
+        } else {
+            this.loadVisualState(0);
+        }
         this.highlightActiveLine(0);
     },
     

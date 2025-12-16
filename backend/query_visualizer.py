@@ -333,6 +333,12 @@ class QueryVisualizer:
                 where_end = len(query_text)
             
             where_clause = query_text[where_idx:where_end].strip()
+            # Remove "where" keyword from the beginning if present
+            if where_clause.lower().startswith('where'):
+                where_clause = where_clause[5:].strip()
+            # Remove trailing semicolon if present
+            if where_clause.endswith(';'):
+                where_clause = where_clause[:-1].strip()
             # Extract column names from WHERE clause
             where_cols = self._extract_column_names(where_clause)
             
@@ -738,18 +744,102 @@ class QueryVisualizer:
                             after_count = len(result_df)
                             explanation = f'Filtered {before_count} rows to {after_count} rows using IN subquery'
                         else:
-                            # For simple conditions like "col < value" or "col > value"
-                            filtered_df = self._apply_where_filter(result_df, condition)
+                            # For conditions with AND - split and apply each part
+                            # _apply_where_filter already handles AND splitting, but we need to ensure it works
+                            # Remove "where" keyword and semicolon if present in condition
+                            filter_condition = condition.strip()
+                            if filter_condition.lower().startswith('where'):
+                                filter_condition = filter_condition[5:].strip()
+                            if filter_condition.endswith(';'):
+                                filter_condition = filter_condition[:-1].strip()
+                            filtered_df = self._apply_where_filter(result_df, filter_condition)
                             result_df = filtered_df
                             after_count = len(result_df)
                             dimmed_count = before_count - after_count
-                            explanation = f'Filtered {before_count} rows to {after_count} rows where {condition}'
+                            explanation = f'Filtered {before_count} rows to {after_count} rows where {filter_condition}'
                     except Exception as e:
                         # If filtering fails, show error in explanation
+                        import traceback
+                        error_details = traceback.format_exc()
+                        print(f"WHERE filter error: {error_details}")
                         explanation = f'Filtering rows where {condition}. Error: {str(e)}'
                         dimmed_rows = []
+                        # Keep original result_df if filtering fails
+                        result_df = result_df if result_df is not None else None
                 else:
                     explanation = 'No data to filter'
+            
+            elif step_type == 'SELECT_COL':
+                # Get result from all previous non-SELECT_COL steps
+                if result_df is None:
+                    # Find the last non-SELECT_COL step
+                    prev_step_index = step_index - 1
+                    while prev_step_index >= 0 and steps[prev_step_index].get('type') == 'SELECT_COL':
+                        prev_step_index -= 1
+                    if prev_step_index >= 0:
+                        result_df = self._execute_steps_up_to(steps, prev_step_index, available_tables)
+                
+                if result_df is not None and len(result_df) > 0:
+                    # Show input table (before column selection)
+                    input_tables = [{
+                        'name': 'Before projection',
+                        'data': self._clean_for_json(result_df.head(50).to_dict('records')),
+                        'columns': list(result_df.columns),
+                        'row_count': len(result_df)
+                    }]
+                    
+                    # Apply column selection incrementally
+                    selected_so_far = current_step.get('selected_so_far', [])
+                    if selected_so_far:
+                        final_cols = []
+                        for col in selected_so_far:
+                            col_name = col.split('.')[-1] if '.' in col else col
+                            
+                            if col_name in result_df.columns:
+                                final_cols.append(col_name)
+                            else:
+                                found = False
+                                for df_col in result_df.columns:
+                                    if df_col.lower() == col_name.lower():
+                                        final_cols.append(df_col)
+                                        found = True
+                                        break
+                                
+                                if not found:
+                                    for df_col in result_df.columns:
+                                        df_col_base = df_col.split('_')[0] if '_' in df_col else df_col
+                                        if df_col_base.lower() == col_name.lower():
+                                            final_cols.append(df_col)
+                                            found = True
+                                            break
+                        
+                        seen = set()
+                        unique_cols = []
+                        for col in final_cols:
+                            if col in result_df.columns and col not in seen:
+                                unique_cols.append(col)
+                                seen.add(col)
+                        
+                        if unique_cols:
+                            result_df = result_df[unique_cols]
+                            highlighted_cols = unique_cols
+                            column_name = current_step.get('column', '')
+                            explanation = f'Selected column: {column_name} ({len(result_df)} rows, {len(unique_cols)} columns)'
+                        else:
+                            explanation = f'Warning: Could not find selected columns {selected_so_far}'
+                    else:
+                        explanation = 'No columns to select'
+                elif result_df is not None and len(result_df) == 0:
+                    # Empty result after filtering - still show structure
+                    input_tables = [{
+                        'name': 'Before projection',
+                        'data': [],
+                        'columns': list(result_df.columns) if hasattr(result_df, 'columns') else [],
+                        'row_count': 0
+                    }]
+                    explanation = 'No rows match the filter conditions'
+                else:
+                    explanation = 'No data to select from'
             
             elif step_type == 'GROUP_BY':
                 # Get result from previous steps (FROM, JOIN, WHERE)
@@ -1243,26 +1333,51 @@ class QueryVisualizer:
         condition = condition.strip()
         if condition.upper().startswith('WHERE'):
             condition = condition[5:].strip()
+        # Remove trailing semicolon if present
+        if condition.endswith(';'):
+            condition = condition[:-1].strip()
+        
+        print(f"DEBUG WHERE: Full condition after strip: '{condition}'")
+        print(f"DEBUG WHERE: Input dataframe has {len(df)} rows")
         
         # Split by ' and ' first to handle AND conditions
         # Then handle OR within each AND group
-        and_parts = condition.split(' and ')
+        # Use case-insensitive split to handle "AND" or "and"
+        and_parts = re.split(r'\s+and\s+', condition, flags=re.IGNORECASE)
+        print(f"DEBUG WHERE: Split into {len(and_parts)} AND parts: {and_parts}")
         filtered_df = df.copy()
         
         for and_part in and_parts:
             and_part = and_part.strip()
+            if not and_part:
+                continue
+            print(f"DEBUG WHERE: Processing AND part: '{and_part}'")
             # Check for OR conditions within this AND part
-            if ' or ' in and_part:
+            if ' or ' in and_part.lower():
                 # Handle OR - at least one condition must be true
-                or_parts = and_part.split(' or ')
+                or_parts = re.split(r'\s+or\s+', and_part, flags=re.IGNORECASE)
                 or_mask = pd.Series([False] * len(filtered_df))
                 for or_cond in or_parts:
                     or_cond = or_cond.strip()
-                    or_mask = or_mask | self._evaluate_condition(filtered_df, or_cond)
+                    if or_cond:
+                        or_mask = or_mask | self._evaluate_condition(filtered_df, or_cond)
                 filtered_df = filtered_df[or_mask]
+                print(f"DEBUG WHERE: After OR, {len(filtered_df)} rows remain")
             else:
-                # Handle single AND condition
-                filtered_df = self._evaluate_condition(filtered_df, and_part, return_df=True)
+                # Handle single AND condition - apply filter sequentially
+                before_count = len(filtered_df)
+                try:
+                    filtered_df = self._evaluate_condition(filtered_df, and_part, return_df=True)
+                    after_count = len(filtered_df)
+                    print(f"DEBUG WHERE: After '{and_part}', {before_count} -> {after_count} rows")
+                except Exception as e:
+                    print(f"DEBUG WHERE: Error evaluating condition '{and_part}': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Return empty dataframe on error
+                    filtered_df = filtered_df.iloc[0:0]
+                    after_count = 0
+                    print(f"DEBUG WHERE: After error, {before_count} -> {after_count} rows")
         
         return filtered_df
     
@@ -1294,31 +1409,72 @@ class QueryVisualizer:
         
         # Handle LIKE / NOT LIKE
         if ' like ' in cond.lower() or ' not like ' in cond.lower():
-            pattern = r'(\w+\.)?(\w+)\s+(not\s+)?like\s+(["\']?)([^"\']+)\4'
+            # Pattern to match: column [NOT] LIKE "pattern" or 'pattern'
+            # Examples: cid like "%bank%", company not like "%bank%"
+            # Try with quotes first (most common case)
+            pattern = r'(\w+\.)?(\w+)\s+(not\s+)?like\s+(["\'])(.*?)\4'
             match = re.search(pattern, cond, re.IGNORECASE)
+            
             if match:
                 col_name = match.group(2)
                 is_not = match.group(3) is not None
-                pattern_str = match.group(5).strip('"\'')
-                
-                # Find column
-                col = None
-                if col_name in df.columns:
-                    col = df[col_name]
+                pattern_str = match.group(5)  # Pattern without quotes
+            else:
+                # Try without quotes (unquoted pattern like: cid like %bank%)
+                pattern = r'(\w+\.)?(\w+)\s+(not\s+)?like\s+([^\s;,\)]+)'
+                match = re.search(pattern, cond, re.IGNORECASE)
+                if match:
+                    col_name = match.group(2)
+                    is_not = match.group(3) is not None
+                    pattern_str = match.group(4).strip('"\'')
                 else:
-                    for df_col in df.columns:
-                        if df_col.lower() == col_name.lower():
-                            col = df[df_col]
-                            break
+                    # Pattern didn't match - log and return empty (shouldn't happen for valid SQL)
+                    print(f"DEBUG LIKE: Pattern did not match condition: '{cond}'")
+                    print(f"DEBUG LIKE: Tried patterns: quoted and unquoted")
+                    # Return empty result if pattern doesn't match (safer than returning all rows)
+                    return df.iloc[0:0] if return_df else pd.Series([False] * len(df))
+            
+            # Find column in dataframe
+            col = None
+            if col_name in df.columns:
+                col = df[col_name]
+            else:
+                # Case-insensitive search
+                for df_col in df.columns:
+                    if df_col.lower() == col_name.lower():
+                        col = df[df_col]
+                        break
+            
+            if col is not None:
+                # Convert SQL LIKE pattern to regex
+                # % matches any sequence (0 or more chars), _ matches single character
+                # Example: "%bank%" -> ".*bank.*"
+                # Strategy: Use simple placeholders that won't appear in patterns
+                placeholder_percent = 'XXXPERCENTXXX'
+                placeholder_underscore = 'XXXUNDERSCOREXXX'
                 
-                if col is not None:
-                    # Convert SQL LIKE pattern to regex (simple version)
-                    # % matches any sequence, _ matches single character
-                    regex_pattern = pattern_str.replace('%', '.*').replace('_', '.')
-                    mask = col.astype(str).str.contains(regex_pattern, case=False, na=False, regex=True)
-                    if is_not:
-                        mask = ~mask
-                    return df[mask] if return_df else mask
+                # Replace % and _ with placeholders BEFORE escaping
+                temp_pattern = pattern_str.replace('%', placeholder_percent).replace('_', placeholder_underscore)
+                # Escape all regex special characters
+                escaped_pattern = re.escape(temp_pattern)
+                # Restore % and _ as regex patterns AFTER escaping
+                regex_pattern = escaped_pattern.replace(placeholder_percent, '.*').replace(placeholder_underscore, '.')
+                
+                # Debug output
+                print(f"DEBUG LIKE: col_name={col_name}, pattern_str={pattern_str}, regex_pattern={regex_pattern}, is_not={is_not}")
+                print(f"DEBUG LIKE: Sample values: {col.head(10).tolist()}")
+                
+                # Apply the pattern
+                mask = col.astype(str).str.contains(regex_pattern, case=False, na=False, regex=True)
+                print(f"DEBUG LIKE: Mask matches: {mask.sum()} out of {len(mask)}")
+                if is_not:
+                    mask = ~mask
+                    print(f"DEBUG LIKE: After NOT, matches: {mask.sum()} out of {len(mask)}")
+                return df[mask] if return_df else mask
+            else:
+                # Column not found - log and return empty
+                print(f"DEBUG LIKE: Column '{col_name}' not found in dataframe. Available columns: {list(df.columns)}")
+                return df.iloc[0:0] if return_df else pd.Series([False] * len(df))
         
         # Handle arithmetic expressions (e.g., "start_hour + duration > 17")
         if '+' in cond or '-' in cond or '*' in cond or '/' in cond:
