@@ -146,6 +146,15 @@ async def get_graph(min_confidence: float = 0.0):
     return graph_data
 
 
+@app.get("/api/schema")
+async def get_schema():
+    """Get a concise schema representation for the schema/ERD view"""
+    try:
+        return graph_builder.get_schema()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/api/table/{table_name}")
 async def get_table_details(table_name: str):
     """Get detailed information about a specific table"""

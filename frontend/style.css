@@ -146,10 +146,173 @@ body {
     overflow: hidden;
 }
 
-.graph-svg {
+.schema-container {
+    flex: 1;
+    position: relative;
+    background: #020617;
+    overflow: hidden;
+}
+
+.graph-svg,
+.schema-svg {
     width: 100%;
     height: 100%;
     display: block;
+}
+
+/* Schema view styles */
+.schema-table {
+    cursor: pointer;
+}
+
+.schema-table rect.schema-table-body {
+    fill: #020617;
+    stroke: #1f2937;
+    stroke-width: 1.5px;
+    rx: 8;
+    ry: 8;
+}
+
+.schema-table rect.schema-table-header {
+    fill: #020617;
+    rx: 8;
+    ry: 8;
+}
+
+.schema-table text.schema-table-title {
+    fill: #f9fafb;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.schema-table text.schema-column-text {
+    fill: #e5e7eb;
+    font-size: 11px;
+}
+
+.schema-link {
+    fill: none;
+    stroke-width: 2.25px;
+    cursor: pointer;
+    stroke-linecap: round;
+    opacity: 0.9;
+}
+
+.schema-link.fk {
+    stroke: #38bdf8;
+    filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.6));
+}
+
+.schema-link.inferred {
+    stroke: #f97316;
+    stroke-dasharray: 4,4;
+    filter: drop-shadow(0 0 4px rgba(249, 115, 22, 0.5));
+}
+
+.schema-table.schema-highlighted rect.schema-table-body {
+    stroke: #2563eb;
+    stroke-width: 2px;
+}
+
+.schema-link.schema-highlighted {
+    stroke-width: 3px;
+}
+
+/* Hover effect for schema relationships */
+.schema-link.schema-link-hovered {
+    stroke: #fbbf24 !important;
+    stroke-width: 4px !important;
+    opacity: 1 !important;
+    filter: drop-shadow(0 0 8px rgba(251, 191, 36, 0.8));
+    animation: schemaLinkPulse 1.5s ease-in-out infinite;
+    z-index: 10;
+}
+
+.schema-table.schema-table-hovered rect.schema-table-body {
+    stroke: #fbbf24 !important;
+    stroke-width: 3px !important;
+    filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.6));
+    animation: schemaTablePulse 1.5s ease-in-out infinite;
+}
+
+@keyframes schemaLinkPulse {
+    0%, 100% {
+        stroke-width: 4px;
+        opacity: 1;
+        filter: drop-shadow(0 0 8px rgba(251, 191, 36, 0.8));
+    }
+    50% {
+        stroke-width: 4.5px;
+        opacity: 0.95;
+        filter: drop-shadow(0 0 12px rgba(251, 191, 36, 1));
+    }
+}
+
+@keyframes schemaTablePulse {
+    0%, 100% {
+        stroke-width: 3px;
+        filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.6));
+    }
+    50% {
+        stroke-width: 3.5px;
+        filter: drop-shadow(0 0 10px rgba(251, 191, 36, 0.8));
+    }
+}
+
+.schema-tooltip {
+    z-index: 1000;
+}
+
+.schema-details-panel {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    width: 360px;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    padding: 0;
+    max-height: 80vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    z-index: 10002;
+    display: none;
+}
+
+.schema-details-panel.visible {
+    display: block;
+}
+
+.schema-details-panel h3 {
+    margin: 0;
+    padding: 16px 20px;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 16px;
+}
+
+.schema-details-panel .schema-details-body {
+    padding: 16px 20px 20px 20px;
+    font-size: 13px;
+}
+
+.schema-details-panel .schema-detail-row {
+    margin-bottom: 8px;
+}
+
+.schema-details-panel .schema-detail-label {
+    font-weight: 600;
+    color: #4b5563;
+}
+
+.schema-details-panel .schema-columns-list {
+    list-style: none;
+    padding-left: 0;
+    margin: 8px 0 0 0;
+}
+
+.schema-details-panel .schema-columns-list li {
+    font-size: 12px;
+    padding: 2px 0;
 }
 
 .node {

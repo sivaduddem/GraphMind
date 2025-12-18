@@ -13,22 +13,28 @@ window.switchView = function(view) {
     console.log('=== switchView called with:', view, '===');
     try {
         const graphView = document.getElementById('graphView');
+        const schemaView = document.getElementById('schemaView');
         const queryView = document.getElementById('queryView');
         const graphTab = document.getElementById('graphViewTab');
+        const schemaTab = document.getElementById('schemaViewTab');
         const queryTab = document.getElementById('queryViewTab');
         const graphControls = document.getElementById('graphControls');
+        const schemaControls = document.getElementById('schemaControls');
         const queryControls = document.getElementById('queryControls');
         
         console.log('Elements found:', { 
             graphView: !!graphView, 
+            schemaView: !!schemaView,
             queryView: !!queryView, 
             graphTab: !!graphTab, 
+            schemaTab: !!schemaTab,
             queryTab: !!queryTab,
             graphControls: !!graphControls,
+            schemaControls: !!schemaControls,
             queryControls: !!queryControls
         });
         
-        if (!graphView || !queryView || !graphTab || !queryTab) {
+        if (!graphView || !schemaView || !queryView || !graphTab || !schemaTab || !queryTab) {
             console.error('View elements not found!');
             alert('Error: View elements not found. Please refresh the page.');
             return;
@@ -37,18 +43,49 @@ window.switchView = function(view) {
         if (view === 'graph') {
             console.log('Switching to Graph View');
             graphView.style.display = 'block';
+            if (schemaView) schemaView.style.display = 'none';
             queryView.style.display = 'none';
             if (graphTab) graphTab.classList.add('active');
+            if (schemaTab) schemaTab.classList.remove('active');
             if (queryTab) queryTab.classList.remove('active');
             if (graphControls) graphControls.style.display = 'block';
+            if (schemaControls) schemaControls.style.display = 'none';
             if (queryControls) queryControls.style.display = 'none';
+            
+            const searchSection = document.getElementById('searchSection');
+            const graphStatsSection = document.getElementById('graphStatsSection');
+            if (searchSection) searchSection.style.display = 'block';
+            if (graphStatsSection) graphStatsSection.style.display = 'block';
+        } else if (view === 'schema') {
+            console.log('Switching to Schema View');
+            graphView.style.display = 'none';
+            schemaView.style.display = 'block';
+            queryView.style.display = 'none';
+            if (graphTab) graphTab.classList.remove('active');
+            if (schemaTab) schemaTab.classList.add('active');
+            if (queryTab) queryTab.classList.remove('active');
+            if (graphControls) graphControls.style.display = 'none';
+            if (schemaControls) schemaControls.style.display = 'block';
+            if (queryControls) queryControls.style.display = 'none';
+            
+            const searchSection = document.getElementById('searchSection');
+            const graphStatsSection = document.getElementById('graphStatsSection');
+            if (searchSection) searchSection.style.display = 'block';
+            if (graphStatsSection) graphStatsSection.style.display = 'block';
+            
+            if (typeof loadSchema === 'function') {
+                loadSchema();
+            }
         } else if (view === 'query') {
             console.log('Switching to Query Visualizer');
             graphView.style.display = 'none';
+            if (schemaView) schemaView.style.display = 'none';
             queryView.style.display = 'block';
             if (graphTab) graphTab.classList.remove('active');
+            if (schemaTab) schemaTab.classList.remove('active');
             if (queryTab) queryTab.classList.add('active');
             if (graphControls) graphControls.style.display = 'none';
+            if (schemaControls) schemaControls.style.display = 'none';
             if (queryControls) queryControls.style.display = 'block';
             
             // Hide Search and Graph Stats sections in Query Visualizer
@@ -68,12 +105,6 @@ window.switchView = function(view) {
                     window.queryVisualizer.loadDatasets();
                 }
             }
-        } else if (view === 'graph') {
-            // Show Search and Graph Stats sections in Graph View
-            const searchSection = document.getElementById('searchSection');
-            const graphStatsSection = document.getElementById('graphStatsSection');
-            if (searchSection) searchSection.style.display = 'block';
-            if (graphStatsSection) graphStatsSection.style.display = 'block';
         }
         console.log('=== switchView completed successfully ===');
     } catch (error) {
@@ -896,6 +927,7 @@ window.queryVisualizer = {
 document.addEventListener('DOMContentLoaded', () => {
     // Add event listeners to tabs as backup
     const graphTab = document.getElementById('graphViewTab');
+    const schemaTab = document.getElementById('schemaViewTab');
     const queryTab = document.getElementById('queryViewTab');
     
     if (graphTab) {
@@ -903,6 +935,25 @@ document.addEventListener('DOMContentLoaded', () => {
             e.preventDefault();
             window.switchView('graph');
         });
+        graphTab.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            console.log('Graph tab clicked via onclick');
+            window.switchView('graph');
+        };
+    }
+    
+    if (schemaTab) {
+        schemaTab.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.switchView('schema');
+        });
+        schemaTab.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            console.log('Schema tab clicked via onclick');
+            window.switchView('schema');
+        };
     }
     
     if (queryTab) {
@@ -912,19 +963,6 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log('Query tab clicked via event listener');
             window.switchView('query');
         });
-    }
-    
-    // Also ensure onclick handlers work
-    if (graphTab) {
-        graphTab.onclick = function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            console.log('Graph tab clicked via onclick');
-            window.switchView('graph');
-        };
-    }
-    
-    if (queryTab) {
         queryTab.onclick = function(e) {
             e.preventDefault();
             e.stopPropagation();
