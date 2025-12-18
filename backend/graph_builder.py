@@ -201,6 +201,89 @@ class GraphBuilder:
                 'stats': edge_data.get('stats', {})
             }
     
+    def get_schema(self) -> Dict[str, Any]:
+        """
+        Build a concise schema representation for frontend schema/ERD view.
+
+        Returns:
+            {
+                "tables": [
+                    {
+                        "name": str,
+                        "source": str,
+                        "columns": [{"name": str, "type": str}],
+                        "column_count": int,
+                        "primary_key": Optional[List[str]]
+                    },
+                    ...
+                ],
+                "relationships": [
+                    {
+                        "from_table": str,
+                        "to_table": str,
+                        "from_columns": List[str],
+                        "to_columns": List[str],
+                        "kind": "fk" | "inferred" | "unknown",
+                        "on_delete": Optional[str],
+                        "on_update": Optional[str],
+                        "confidence": float
+                    },
+                    ...
+                ]
+            }
+        """
+        tables: List[Dict[str, Any]] = []
+        relationships: List[Dict[str, Any]] = []
+
+        # Build table list
+        for table_name, info in self.table_data.items():
+            columns = info.get('columns', []) or []
+
+            # Best-effort primary key inference: look for "id" column
+            pk_cols: List[str] = []
+            for col in columns:
+                col_name = str(col.get('name', '')).lower()
+                if col_name == 'id':
+                    pk_cols = [col.get('name')]
+                    break
+
+            tables.append(
+                {
+                    "name": table_name,
+                    "source": info.get("source", "unknown"),
+                    "columns": [
+                        {
+                            "name": col.get("name"),
+                            "type": col.get("type", "unknown"),
+                        }
+                        for col in columns
+                    ],
+                    "column_count": len(columns),
+                    "primary_key": pk_cols or None,
+                }
+            )
+
+        # Build relationships list from graph edges
+        for source, target, data in self.graph.edges(data=True):
+            # Handle multiple edges between same nodes
+            edge_list = data["edges"] if "edges" in data else [data]
+
+            for edge in edge_list:
+                relationships.append(
+                    {
+                        "from_table": source,
+                        "to_table": target,
+                        "from_columns": edge.get("from_columns", []),
+                        "to_columns": edge.get("to_columns", []),
+                        "kind": edge.get("kind", "unknown"),
+                        "on_delete": edge.get("on_delete"),
+                        "on_update": edge.get("on_update"),
+                        "confidence": edge.get("confidence", 1.0),
+                    }
+                )
+
+        return {"tables": tables, "relationships": relationships}
+    
     def to_json(self, min_confidence: float = 0.0) -> Dict[str, Any]:
         """Convert graph to JSON format for frontend (with caching)"""
         # Return cached result if available and confidence matches

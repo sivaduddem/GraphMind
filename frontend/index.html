@@ -52,6 +52,20 @@
                 <button class="btn btn-secondary" onclick="clearGraph()">Clear Graph</button>
             </div>
 
+            <!-- Schema View Controls -->
+            <div class="sidebar-section" id="schemaControls" style="display: none;">
+                <h2>Schema Controls</h2>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="schemaShowFK" checked>
+                    <label for="schemaShowFK">Show Foreign Keys</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="schemaShowInferred" checked>
+                    <label for="schemaShowInferred">Show Inferred</label>
+                </div>
+                <button class="btn btn-secondary" id="schemaResetZoomBtn">Reset Schema Zoom</button>
+            </div>
+
             <!-- Query Visualizer Controls -->
             <div class="sidebar-section" id="queryControls" style="display: none;">
                 <h2>Query Visualizer</h2>
@@ -94,6 +108,7 @@
             <!-- View Switcher Tabs -->
             <div class="view-switcher">
                 <button class="view-tab active" id="graphViewTab" onclick="if(window.switchView){window.switchView('graph');}else{console.error('switchView not found');}">Graph View</button>
+                <button class="view-tab" id="schemaViewTab" onclick="if(window.switchView){window.switchView('schema');}else{console.error('switchView not found');}">Schema View</button>
                 <button class="view-tab" id="queryViewTab" onclick="if(window.switchView){window.switchView('query');}else{console.error('switchView not found');}">Query Visualizer</button>
             </div>
 
@@ -104,6 +119,17 @@
                     <div class="tooltip" id="tooltip"></div>
                     <div class="details-panel" id="detailsPanel">
                         <div id="detailsContent"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Schema View -->
+            <div class="view-container" id="schemaView" style="display: none;">
+                <div class="schema-container">
+                    <svg class="schema-svg" id="schemaSvg"></svg>
+                    <div class="tooltip schema-tooltip" id="schemaTooltip"></div>
+                    <div class="schema-details-panel" id="schemaDetailsPanel">
+                        <div id="schemaDetailsContent"></div>
                     </div>
                 </div>
             </div>
