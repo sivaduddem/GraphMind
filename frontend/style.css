@@ -162,7 +162,7 @@ body {
 
 /* Schema view styles */
 .schema-table {
-    cursor: pointer;
+    cursor: move;
 }
 
 .schema-table rect.schema-table-body {
