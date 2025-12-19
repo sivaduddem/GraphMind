@@ -1066,6 +1066,12 @@ body {
     padding-left: 0 !important;
 }
 
+/* Add padding to first line to prevent line number from blocking text */
+.CodeMirror-line:first-child {
+    padding-left: 0 !important;
+    text-indent: 0 !important;
+}
+
 /* Prevent selection and editing before line 1 */
 .CodeMirror-line:first-child {
     /* Ensure first line is always accessible */

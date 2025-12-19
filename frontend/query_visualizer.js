@@ -145,16 +145,25 @@ window.queryVisualizer = {
                 gutters: ['CodeMirror-linenumbers']
             });
             
-            // Ensure editor content starts at line 0 (displayed as line 1)
+            // Ensure editor content starts at line 0 (displayed as line 1) with a tab
             // Remove any content that might exist before line 0
             const currentValue = this.sqlEditor.getValue();
             if (currentValue) {
                 const lines = currentValue.split('\n');
+                // Ensure first line starts with a tab if it doesn't already start with whitespace
+                if (lines.length > 0 && lines[0] && !/^\s/.test(lines[0])) {
+                    lines[0] = '\t' + lines[0];
+                }
                 // Ensure we start with content at line 0
                 const cleanedValue = lines.join('\n');
                 if (cleanedValue !== currentValue) {
                     this.sqlEditor.setValue(cleanedValue);
                 }
+            } else {
+                // If editor is empty, start with a tab
+                this.sqlEditor.setValue('\t');
+                // Move cursor to after the tab
+                this.sqlEditor.setCursor({line: 0, ch: 1});
             }
             
             // Prevent editing before line 1 (line 0 in CodeMirror) and in gutter area on ANY line
@@ -347,6 +356,20 @@ window.queryVisualizer = {
                         // Cursor somehow got into gutter area, move to start of line
                         cm.setCursor({line: cursor.line, ch: 0});
                     }
+                    
+                    // Ensure line 0 (first line) starts with a tab if it has content
+                    const firstLine = doc.getLine(0);
+                    if (firstLine && !/^\s/.test(firstLine)) {
+                        // First line doesn't start with whitespace, add a tab
+                        const currentCursor = cm.getCursor();
+                        doc.replaceRange('\t', {line: 0, ch: 0}, {line: 0, ch: 0});
+                        // Restore cursor position, adjusting for the added tab
+                        if (currentCursor.line === 0) {
+                            cm.setCursor({line: 0, ch: currentCursor.ch + 1});
+                        } else {
+                            cm.setCursor(currentCursor);
+                        }
+                    }
                 }
             });
             
@@ -357,12 +380,27 @@ window.queryVisualizer = {
             const originalSetValue = this.sqlEditor.setValue.bind(this.sqlEditor);
             this.sqlEditor.setValue = (value) => {
                 // Ensure value doesn't start with newlines that would create content before line 0
-                const cleanedValue = value ? value.replace(/^\n+/, '') : value;
+                let cleanedValue = value ? value.replace(/^\n+/, '') : value;
+                // Ensure first line starts with a tab if it doesn't already start with whitespace
+                if (cleanedValue) {
+                    const lines = cleanedValue.split('\n');
+                    if (lines.length > 0 && lines[0] && !/^\s/.test(lines[0])) {
+                        lines[0] = '\t' + lines[0];
+                        cleanedValue = lines.join('\n');
+                    }
+                } else {
+                    cleanedValue = '\t';
+                }
                 originalSetValue(cleanedValue);
-                // Reset cursor to line 0, column 0 (not in gutter)
+                // Reset cursor to line 0, after the tab (not in gutter)
                 setTimeout(() => {
                     const cursor = this.sqlEditor.getCursor();
-                    this.sqlEditor.setCursor({line: Math.max(0, cursor.line), ch: Math.max(0, cursor.ch)});
+                    // If cursor is at the start of line 0, move it after the tab
+                    if (cursor.line === 0 && cursor.ch === 0) {
+                        this.sqlEditor.setCursor({line: 0, ch: 1});
+                    } else {
+                        this.sqlEditor.setCursor({line: Math.max(0, cursor.line), ch: Math.max(0, cursor.ch)});
+                    }
                 }, 0);
             };
             
