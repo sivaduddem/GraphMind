@@ -1,1881 +1,2434 @@
 """
-SQL Query Visualizer
-Parses SQL queries, extracts semantic steps, and executes them step-by-step
+Simplified SQL Query Executor
+
+Original `QueryVisualizer` was a very large class responsible for:
+- Parsing SQL into "steps"
+- Producing per-line / per-step visual states
+- Manually emulating parts of SQL with pandas
+
+For this project we only want **one responsibility**:
+Given a SQL query string, execute it against the data that has been
+loaded into `GraphBuilder` and **return the result rows**.
 """
+
+from typing import Dict, Any, Optional, List, Tuple
+from contextlib import contextmanager
 import re
-import sqlparse
-from typing import Dict, List, Any, Optional, Tuple
-from collections import defaultdict
-import pandas as pd
-import numpy as np
+import sys
+import traceback
 import math
+import numpy as np
+import pandas as pd
 
 # Try to import duckdb, but make it optional
-try:
+try:  # pragma: no cover - environment dependent
     import duckdb
     HAS_DUCKDB = True
-except ImportError:
+except ImportError:  # pragma: no cover - duckdb not installed
     HAS_DUCKDB = False
     duckdb = None
 
+# Try to import sqlparse for SQL parsing
+try:
+    import sqlparse
+    from sqlparse.tokens import Keyword, DML, Name
+    HAS_SQLPARSE = True
+except ImportError:
+    HAS_SQLPARSE = False
+    sqlparse = None
 
-class QueryVisualizer:
-    """Parses SQL queries and generates step-by-step visualization states"""
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Step types
+STEP_FROM = 'FROM'
+STEP_JOIN = 'JOIN'
+STEP_WHERE = 'WHERE'
+STEP_GROUP_BY = 'GROUP_BY'
+STEP_HAVING = 'HAVING'
+STEP_SELECT = 'SELECT'
+STEP_ORDER_BY = 'ORDER_BY'
+STEP_FINAL_RESULT = 'FINAL_RESULT'
+STEP_UNION_INPUT = 'UNION_INPUT'
+STEP_UNION = 'UNION'
+
+# SQL keywords
+KEYWORD_WHERE = 'WHERE'
+KEYWORD_GROUP = 'GROUP'
+KEYWORD_HAVING = 'HAVING'
+KEYWORD_ORDER = 'ORDER'
+KEYWORD_BY = 'BY'
+KEYWORD_SELECT = 'SELECT'
+KEYWORD_FROM = 'FROM'
+KEYWORD_JOIN = 'JOIN'
+KEYWORD_ON = 'ON'
+
+# Table name constants
+TABLE_LEFT = 'left_table'
+TABLE_INPUT = 'input_table'
+TABLE_JOINED_RESULT = 'joined_result'
+TABLE_FILTERED_RESULT = 'filtered_result'
+TABLE_GROUPED_RESULT = 'grouped_result'
+TABLE_FILTERED_GROUPS = 'filtered_groups'
+TABLE_PROJECTED_RESULT = 'projected_result'
+TABLE_SORTED_RESULT = 'sorted_result'
+
+# Column extraction skip keywords
+SKIP_KEYWORDS_BASE = {'AND', 'OR', 'NOT', 'IN', 'LIKE', 'IS', 'NULL', 'TRUE', 'FALSE', 'BETWEEN', 'AS', 'ON'}
+SKIP_KEYWORDS_AGGREGATION = {'SUM', 'COUNT', 'AVG', 'MAX', 'MIN'}
+
+# Compiled regex patterns for better performance
+_RE_COL_WITH_OPERATORS = re.compile(r'(?:^\w+\.)?(\w+)(?=\s*(?:=|!=|<>|<|>|<=|>=|LIKE|NOT|IN|IS))')
+_RE_TABLE_COL = re.compile(r'\b\w+\.(\w+)\b')
+_RE_STANDALONE_COL = re.compile(r'(?<![.\w])(\w+)(?=\s*(?:=|!=|<>|<|>|<=|>=))')
+_RE_LIKE_PATTERN = re.compile(r'(\w+)\.(\w+)\s+LIKE', re.IGNORECASE)
+_RE_IN_CLAUSE = re.compile(r'\b(\w+)\s+IN\s*\(', re.IGNORECASE)
+_RE_BETWEEN_CLAUSE = re.compile(r'\b(\w+)\s+BETWEEN\s+', re.IGNORECASE)
+_RE_AGG_FUNC_WITH_PREFIX = re.compile(r'(?:SUM|COUNT|AVG|MAX|MIN)\s*\(\s*(\w+)\.(\w+)\s*\)', re.IGNORECASE)
+_RE_AGG_FUNC_WITHOUT_PREFIX = re.compile(r'(?:SUM|COUNT|AVG|MAX|MIN)\s*\(\s*(?:DISTINCT\s+)?(\w+)\s*\)', re.IGNORECASE)
+_RE_AGG_WITH_ALIAS = re.compile(r'(?i)(SUM|COUNT|AVG|MAX|MIN)\s*\(\s*(?:DISTINCT\s+)?(?:\w+\.)?(\w+)\s*\)')
+_RE_AGG_COL_WITH_PREFIX = re.compile(r'(?:SUM|COUNT|AVG|MAX|MIN)\s*\(\s*(?:DISTINCT\s+)?(?:\w+\.)?(\w+)\s*\)', re.IGNORECASE)
+_RE_AGG_COL_TABLE_PREFIX = re.compile(r'(?:SUM|COUNT|AVG|MAX|MIN)\s*\(\s*\w+\.(\w+)\s*\)', re.IGNORECASE)
+_RE_NORMALIZE_SPACES = re.compile(r'\s+')
+_RE_NORMALIZE_FUNC_WITH_TABLE = re.compile(r'(\w+)\s*\(\s*(\w+)\s*\.\s*(\w+)\s*\)', re.IGNORECASE)
+_RE_NORMALIZE_FUNC_WITHOUT_TABLE = re.compile(r'(\w+)\s*\(\s*(\w+)\s*\)', re.IGNORECASE)
+_RE_NORMALIZE_TABLE_COL = re.compile(r'(\w+)\s*\.\s*(\w+)')
+_RE_STRIP_TABLE_ALIAS = re.compile(r'\b\w+\.(\w+)\b')
+_RE_ALIAS_COL_PATTERN = re.compile(r'\b(\w+)\.(\w+)\b')  # For alias.column pattern matching
+# Note: _RE_AGG_REPLACE is created dynamically in _execute_having_query, not here
+_RE_GROUP_BY_FALLBACK = re.compile(
+    rf'{re.escape(KEYWORD_GROUP)}\s+{re.escape(KEYWORD_BY)}\s+(.+?)(?:\s+{re.escape(KEYWORD_HAVING)}\b|\s+{re.escape(KEYWORD_ORDER)}\s+{re.escape(KEYWORD_BY)}\b|;|$)',
+    re.IGNORECASE | re.DOTALL
+)
+_RE_ORDER_BY_FALLBACK = re.compile(
+    rf'{re.escape(KEYWORD_ORDER)}\s+{re.escape(KEYWORD_BY)}\s+(.+?)(?:;|$)',
+    re.IGNORECASE | re.DOTALL
+)
+_RE_UNION_SPLIT = re.compile(r'\bUNION\b', re.IGNORECASE)
+
+
+# ============================================================================
+# Debug Logging Utility
+# ============================================================================
+
+class DebugLogger:
+    """Centralized debug logging utility."""
     
-    def __init__(self, graph_builder):
-        self.graph_builder = graph_builder
-        self.compiled_queries = {}  # Cache compiled queries by query_id
+    _enabled = True  # Set to False to disable all debug output
     
-    def _clean_for_json(self, obj):
-        """Recursively clean NaN, inf, and -inf values from data structures for JSON serialization"""
-        if isinstance(obj, dict):
-            return {k: self._clean_for_json(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._clean_for_json(item) for item in obj]
-        elif isinstance(obj, (float, np.floating)):
-            if pd.isna(obj) or math.isnan(obj):
-                return None
-            elif math.isinf(obj):
-                return None
-            else:
-                return obj
-        elif isinstance(obj, pd.Series):
-            return [self._clean_for_json(item) for item in obj]
-        elif isinstance(obj, pd.DataFrame):
-            # Convert DataFrame to dict and clean
-            return self._clean_for_json(obj.to_dict('records'))
-        else:
-            return obj
+    @classmethod
+    def log(cls, message: str, *args):
+        """Log a debug message."""
+        if cls._enabled:
+            formatted = message.format(*args) if args else message
+            print(f"DEBUG: {formatted}", file=sys.stderr)
+    
+    @classmethod
+    def disable(cls):
+        """Disable debug logging."""
+        cls._enabled = False
+    
+    @classmethod
+    def enable(cls):
+        """Enable debug logging."""
+        cls._enabled = True
+
+
+# ============================================================================
+# SQL Query Parser
+# ============================================================================
+
+class SQLQueryParser:
+    """Parser for SQL queries to extract execution steps."""
+    
+    def __init__(self):
+        self.steps = []
+    
+    def parse(self, query_text: str) -> List[Dict[str, Any]]:
+        """Parse SQL query and extract steps in execution order."""
+        if not HAS_SQLPARSE:
+            raise RuntimeError("sqlparse library is required for step-by-step visualization")
         
-    def compile_query(self, query_text: str, query_id: Optional[str] = None) -> Dict[str, Any]:
+        self.steps = []
+
+        # Handle simple top-level UNION between two SELECT statements up-front.
+        # For now we intentionally *skip* UNION ALL / INTERSECT / EXCEPT.
+        upper_sql = query_text.upper()
+        if 'UNION' in upper_sql and 'UNION ALL' not in upper_sql:
+            union_steps = self._parse_union(query_text)
+            if union_steps:
+                return union_steps
+        
+        parsed = sqlparse.parse(query_text)[0]
+        
+        # Debug: check parsed structure
+        DebugLogger.log("Parsed SQL structure: {}", type(parsed))
+        DebugLogger.log("Parsed SQL tokens (first level): {} tokens", len(list(parsed.tokens)) if hasattr(parsed, 'tokens') else 0)
+        
+        # Extract clauses in execution order
+        from_tables, from_table_aliases = self._extract_from_tables(parsed)
+        joins = self._extract_joins(parsed)
+        DebugLogger.log("Found {} JOIN clauses", len(joins))
+        
+        # Add FROM step only if no JOINs (JOIN step handles FROM)
+        if from_tables and len(joins) == 0:
+            self._add_step(STEP_FROM, {'tables': from_tables})
+        
+        # Add JOIN steps
+        for join in joins:
+            left_table_name = from_tables[0] if from_tables else None
+            left_table_alias = from_table_aliases.get(left_table_name) if left_table_name else None
+            step_info = {
+                'join_type': join['type'],
+                'left_table': left_table_name,
+                'left_table_alias': left_table_alias,
+                'from_tables': from_tables,
+                'right_table': join['right_table'],
+                'right_table_alias': join.get('right_table_alias'),
+                'join_condition': join['condition'],
+                'join_columns': join['columns'],
+            }
+            self._add_step(STEP_JOIN, step_info)
+            DebugLogger.log("Added JOIN step: {}", step_info)
+        
+        # Extract and add other clauses
+        self._extract_and_add_where(parsed)
+        self._extract_and_add_group_by(parsed)
+        self._extract_and_add_having(parsed)
+        self._extract_and_add_select(parsed)
+        self._extract_and_add_order_by(parsed)
+        
+        return self.steps
+    
+    def _add_step(self, step_type: str, step_data: Dict[str, Any]):
+        """Add a step to the steps list."""
+        step_data['step_type'] = step_type
+        step_data['step_number'] = len(self.steps) + 1
+        self.steps.append(step_data)
+
+    def _parse_union(self, query_text: str) -> List[Dict[str, Any]]:
+        """Detect and register steps for a basic UNION between two SELECTs.
+
+        We parse each SELECT statement to extract its internal steps (FROM, JOIN, WHERE, etc.),
+        then add a UNION step that combines their results.
+
+        This is intentionally conservative and only supports a single
+        top-level UNION (no UNION ALL, INTERSECT, or EXCEPT, and no nested
+        set operations).
         """
-        Compile a SQL query into semantic steps and line mappings
+        # Split on the first occurrence of UNION (case-insensitive).
+        parts = _RE_UNION_SPLIT.split(query_text, maxsplit=1)
+        if len(parts) < 2:
+            return []
+        
+        left_sql = parts[0].strip().rstrip(';')
+        right_sql = parts[1].strip().rstrip(';')
+        
+        # Basic sanity check: both sides should look like SELECT statements.
+        if not left_sql.upper().lstrip().startswith('SELECT'):
+            return []
+        if not right_sql.upper().lstrip().startswith('SELECT'):
+            return []
+        
+        # Parse the left SELECT statement to get its steps
+        left_parser = SQLQueryParser()
+        left_steps = left_parser.parse(left_sql)
+        
+        # Add left side steps with union_side indicator
+        for step in left_steps:
+            step['union_side'] = 'left'
+            step['step_type'] = step.get('step_type', 'UNKNOWN')
+            step['step_number'] = len(self.steps) + 1
+            self.steps.append(step)
+        
+        # Parse the right SELECT statement to get its steps
+        right_parser = SQLQueryParser()
+        right_steps = right_parser.parse(right_sql)
+        
+        # Add right side steps with union_side indicator
+        for step in right_steps:
+            step['union_side'] = 'right'
+            step['step_type'] = step.get('step_type', 'UNKNOWN')
+            step['step_number'] = len(self.steps) + 1
+            self.steps.append(step)
+        
+        # Register the UNION combination step.
+        self._add_step(STEP_UNION, {
+            'left_query': left_sql,
+            'right_query': right_sql,
+        })
+        
+        return self.steps
+    
+    def _extract_from_tables(self, parsed) -> Tuple[List[str], Dict[str, str]]:
+        """Extract table names and aliases from FROM clause.
         
         Returns:
-            {
-                'steps': List[Step],
-                'line_to_step': Dict[int, int],  # line number -> step index
-                'line_count': int,
-                'query_id': str
-            }
+            tuple: (list of table names, dict mapping table_name -> alias)
         """
-        # Store original query for reference
-        original_query = query_text
+        tables = []
+        table_aliases = {}  # Maps table_name -> alias
+        from_seen = False
+        tokens = list(parsed.flatten())
+        stop_keywords = ['JOIN', 'WHERE', 'GROUP', 'ORDER', 'HAVING']
         
-        # Remove "CREATE OR REPLACE VIEW viewname AS" prefix if present
-        # Extract only the SELECT statement
-        query_lower = query_text.lower().strip()
-        if 'create' in query_lower and 'view' in query_lower:
-            # Find the SELECT keyword after CREATE VIEW
-            select_idx = query_lower.find('select')
-            if select_idx >= 0:
-                query_text = query_text[select_idx:].strip()
-        
-        # Note: We keep the trailing semicolon during parsing so sqlparse can handle it correctly
-        # Semicolons in the middle (like "employee;") will be stripped from table names during extraction
-        
-        # Check for UNION queries
-        has_union = ' union ' in query_lower
-        if has_union:
-            # Split by UNION
-            union_parts = re.split(r'\s+union\s+', query_text, flags=re.IGNORECASE)
-            if len(union_parts) == 2:
-                # Process as UNION query
-                steps = self._extract_union_steps(union_parts[0], union_parts[1], query_text)
-                query_lines = query_text.split('\n')
-                line_count = len(query_lines)
-            else:
-                raise ValueError("UNION queries with more than 2 parts are not yet supported")
-        else:
-            # Parse SQL into AST
-            parsed = sqlparse.parse(query_text)
-            if not parsed or not parsed[0]:
-                raise ValueError("Invalid SQL query")
-            
-            ast = parsed[0]
-            query_lines = query_text.split('\n')
-            line_count = len(query_lines)
-            
-            # Extract semantic steps
-            steps = self._extract_steps(ast, query_text)
-        
-        # Map SQL lines to step indices
-        line_to_step = self._map_lines_to_steps(query_text, steps, line_count)
-        
-        query_id = query_id or f"query_{hash(query_text)}"
-        
-        # Create sub_steps list for granular stepping (one per SELECT_COL step)
-        sub_steps = []
-        for i, step in enumerate(steps):
-            if step['type'] == 'SELECT_COL':
-                sub_steps.append({
-                    'step_index': i,
-                    'sub_step_index': len(sub_steps),
-                    'type': 'SELECT_COL',
-                    'column': step.get('column', ''),
-                    'description': step.get('description', '')
-                })
-            else:
-                sub_steps.append({
-                    'step_index': i,
-                    'sub_step_index': len(sub_steps),
-                    'type': step['type'],
-                    'description': step.get('description', '')
-                })
-        
-        result = {
-            'steps': steps,
-            'sub_steps': sub_steps,  # Granular steps for frontend
-            'line_to_step': line_to_step,
-            'line_count': line_count,
-            'total_steps': len(steps),  # Total semantic steps
-            'total_sub_steps': len(sub_steps),  # Total granular steps
-            'query_id': query_id
-        }
-        
-        # Cache compiled query
-        self.compiled_queries[query_id] = result
-        
-        return result
-    
-    def get_visual_state(self, query_id: str, line_index: int, sub_step_index: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Get the visual state for a specific line index
-        
-        Returns:
-            {
-                'input_tables': List[Dict],  # Tables to display as input
-                'output_table': Dict,  # Result table after this step
-                'highlighted_cols': List[str],
-                'dimmed_rows': List[int],  # Row indices to dim
-                'annotations': Dict,
-                'explanation_text': str,
-                'step_type': str,
-                'before_row_count': int,
-                'after_row_count': int,
-                'join_condition': Optional[Dict]
-            }
-        """
-        if query_id not in self.compiled_queries:
-            raise ValueError(f"Query {query_id} not found. Compile query first.")
-        
-        compiled = self.compiled_queries[query_id]
-        
-        # If sub_step_index is provided, use granular stepping
-        if sub_step_index is not None and 'sub_steps' in compiled:
-            sub_steps = compiled['sub_steps']
-            if sub_step_index < 0:
-                sub_step_index = 0
-            if sub_step_index >= len(sub_steps):
-                sub_step_index = len(sub_steps) - 1
-            
-            sub_step_info = sub_steps[sub_step_index]
-            step_index = sub_step_info['step_index']
-            steps = compiled['steps']
-        else:
-            # Legacy line-based stepping
-            line_to_step = compiled['line_to_step']
-            step_index = line_to_step.get(line_index, -1)
-            if step_index < 0:
-                return {
-                    'input_tables': [],
-                    'output_table': None,
-                    'highlighted_cols': [],
-                    'dimmed_rows': [],
-                    'annotations': {},
-                    'explanation_text': 'Ready to execute query',
-                    'step_type': 'initial',
-                    'before_row_count': 0,
-                    'after_row_count': 0,
-                    'join_condition': None
-                }
-            
-            steps = compiled['steps']
-            if step_index >= len(steps):
-                step_index = len(steps) - 1
-        
-        # Execute query up to this step
-        try:
-            visual_state = self._execute_step(step_index, steps, query_id)
-        except Exception as e:
-            # Fallback if execution fails
-            current_step = steps[step_index] if step_index < len(steps) else None
-            visual_state = {
-                'input_tables': [],
-                'output_table': None,
-                'highlighted_cols': [],
-                'dimmed_rows': [],
-                'annotations': {'error': str(e)},
-                'explanation_text': current_step.get('description', f'Error executing step: {str(e)}') if current_step else f'Error: {str(e)}',
-                'step_type': current_step.get('type', 'error') if current_step else 'error',
-                'before_row_count': 0,
-                'after_row_count': 0,
-                'join_condition': None
-            }
-        
-        # Ensure explanation is always set - use step description as fallback
-        if not visual_state.get('explanation_text') or visual_state.get('explanation_text') in ['Processing query step...', 'Processing query step', 'No explanation available']:
-            current_step = steps[step_index] if step_index < len(steps) else None
-            if current_step:
-                # Use the step's description field which should always be set during compilation
-                visual_state['explanation_text'] = current_step.get('description', f'Executing {current_step.get("type", "step")}')
-            else:
-                visual_state['explanation_text'] = 'Ready to execute query'
-        
-        return visual_state
-    
-    def _extract_steps(self, ast, query_text: str) -> List[Dict[str, Any]]:
-        """Extract semantic steps from SQL AST"""
-        steps = []
-        
-        # Tokenize and identify clauses
-        tokens = list(ast.flatten())
-        token_strs = [str(t).strip() for t in tokens if str(t).strip()]
-        query_lower = query_text.lower()
-        
-        # Find FROM clause - use string search as more reliable
-        from_idx = query_lower.find(' from ')
-        from_table = None
-        if from_idx >= 0:
-            # Find the table name after FROM
-            from_start = from_idx + 6  # Skip " from "
-            # Find where the table name ends (before JOIN, WHERE, or end of line)
-            from_end = query_lower.find(' join ', from_start)
-            if from_end < 0:
-                from_end = query_lower.find(' where ', from_start)
-            if from_end < 0:
-                from_end = query_lower.find(' group ', from_start)
-            if from_end < 0:
-                from_end = len(query_text)
-            
-            from_clause = query_text[from_start:from_end].strip()
-            # Extract table name (remove alias if present)
-            # Handle "table alias" or "table AS alias"
-            parts = from_clause.split()
-            if parts:
-                from_table = parts[0].strip('"\'`').rstrip(';')  # Remove semicolon if present in middle
-                # Skip alias if present
-                if len(parts) > 1 and parts[1].upper() not in ['AS', 'ON', 'USING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'JOIN']:
-                    # parts[1] might be an alias, but we already got the table name
-                    pass
-        
-        if from_table:
-            steps.append({
-                'type': 'FROM',
-                'table': from_table,
-                'line_range': self._find_line_range_for_text(query_text, from_idx),
-                'description': f'Load table {from_table}'
-            })
-        
-        # Find JOIN clauses - use string search for reliability
-        join_positions = []
-        search_start = 0
-        while True:
-            join_idx = query_lower.find(' join ', search_start)
-            if join_idx < 0:
-                break
-            
-            # Determine join type
-            before_join = query_lower[max(0, join_idx-10):join_idx].strip()
-            join_type = 'INNER JOIN'
-            if 'left' in before_join:
-                join_type = 'LEFT JOIN'
-            elif 'right' in before_join:
-                join_type = 'RIGHT JOIN'
-            elif 'full' in before_join:
-                join_type = 'FULL JOIN'
-            
-            # Find table name after JOIN
-            join_start = join_idx + 6  # Skip " join "
-            # Find where table name ends (before ON, WHERE, etc.)
-            table_end = query_lower.find(' on ', join_start)
-            if table_end < 0:
-                table_end = query_lower.find(' where ', join_start)
-            if table_end < 0:
-                table_end = query_lower.find(' group ', join_start)
-            if table_end < 0:
-                table_end = len(query_text)
-            
-            join_table_clause = query_text[join_start:table_end].strip()
-            parts = join_table_clause.split()
-            join_table = parts[0].strip('"\'`').rstrip(';') if parts else None  # Remove semicolon if present in middle
-            
-            # Find ON condition
-            join_condition = None
-            on_idx = query_lower.find(' on ', join_start)
-            if on_idx >= 0:
-                on_start = on_idx + 4  # Skip " on "
-                condition_end = query_lower.find(' where ', on_start)
-                if condition_end < 0:
-                    condition_end = query_lower.find(' group ', on_start)
-                if condition_end < 0:
-                    condition_end = len(query_text)
-                join_condition = query_text[on_start:condition_end].strip().rstrip(';')
-            
-            if join_table:
-                steps.append({
-                    'type': 'JOIN',
-                    'join_type': join_type,
-                    'table': join_table,
-                    'condition': join_condition,
-                    'line_range': self._find_line_range_for_text(query_text, join_idx),
-                    'description': f'{join_type} with {join_table}'
-                })
-            
-            search_start = join_idx + 1
-        
-        # Find WHERE clause
-        where_idx = query_lower.find(' where ')
-        if where_idx >= 0:
-            where_end = query_lower.find(' group ', where_idx)
-            if where_end < 0:
-                where_end = query_lower.find(' having ', where_idx)
-            if where_end < 0:
-                where_end = query_lower.find(' order ', where_idx)
-            if where_end < 0:
-                where_end = len(query_text)
-            
-            where_clause = query_text[where_idx:where_end].strip()
-            # Remove "where" keyword from the beginning if present
-            if where_clause.lower().startswith('where'):
-                where_clause = where_clause[5:].strip()
-            # Remove trailing semicolon if present
-            if where_clause.endswith(';'):
-                where_clause = where_clause[:-1].strip()
-            # Extract column names from WHERE clause
-            where_cols = self._extract_column_names(where_clause)
-            
-            steps.append({
-                'type': 'WHERE',
-                'condition': where_clause,
-                'columns': where_cols,
-                'line_range': self._find_line_range_for_text(query_text, where_idx),
-                'description': f'Filter rows: {where_clause}'
-            })
-        
-        # Find GROUP BY clause
-        group_idx = query_lower.find(' group by ')
-        if group_idx >= 0:
-            group_end = query_lower.find(' having ', group_idx)
-            if group_end < 0:
-                group_end = query_lower.find(' order ', group_idx)
-            if group_end < 0:
-                group_end = len(query_text)
-            
-            group_clause = query_text[group_idx:group_end].strip()
-            group_cols = self._extract_column_names(group_clause)
-            
-            steps.append({
-                'type': 'GROUP_BY',
-                'columns': group_cols,
-                'line_range': self._find_line_range_for_text(query_text, group_idx),
-                'description': f'Group by: {", ".join(group_cols)}'
-            })
-        
-        # Find HAVING clause
-        having_idx = query_lower.find(' having ')
-        if having_idx >= 0:
-            having_end = query_lower.find(' order ', having_idx)
-            if having_end < 0:
-                having_end = len(query_text)
-            
-            having_clause = query_text[having_idx:having_end].strip()
-            having_cols = self._extract_column_names(having_clause)
-            
-            steps.append({
-                'type': 'HAVING',
-                'condition': having_clause,
-                'columns': having_cols,
-                'line_range': self._find_line_range_for_text(query_text, having_idx),
-                'description': f'Filter groups: {having_clause}'
-            })
-        
-        # Find SELECT clause (projection) - break into individual column steps
-        select_idx = query_lower.find('select ')
-        if select_idx >= 0:
-            select_end = query_lower.find(' from ', select_idx)
-            if select_end < 0:
-                select_end = len(query_text)
-            
-            select_clause = query_text[select_idx:select_end].strip()
-            select_cols = self._extract_column_names(select_clause)
-            
-            # Break SELECT into individual column selection steps for granular visualization
-            # Each column gets its own step so we can show them one at a time
-            for i, col in enumerate(select_cols):
-                select_step = {
-                    'type': 'SELECT_COL',
-                    'column': col,
-                    'column_index': i,
-                    'all_columns': select_cols,
-                    'selected_so_far': select_cols[:i+1],  # Columns selected up to this point
-                    'line_range': self._find_line_range_for_text(query_text, select_idx),
-                    'description': f'Select column: {col.split(".")[-1] if "." in col else col}'
-                }
-                steps.append(select_step)
-        
-        # Sort steps by line number (SELECT_COL steps go at the end)
-        non_select_steps = [s for s in steps if s.get('type') != 'SELECT_COL']
-        non_select_steps.sort(key=lambda s: s['line_range'][0] if s.get('line_range') and isinstance(s['line_range'], tuple) else 999)
-        
-        # Add SELECT_COL steps at the end, sorted by column_index
-        select_col_steps = [s for s in steps if s.get('type') == 'SELECT_COL']
-        select_col_steps.sort(key=lambda s: s.get('column_index', 0))
-        
-        # Rebuild steps
-        steps = non_select_steps + select_col_steps
-        
-        return steps
-    
-    def _extract_column_names(self, text: str) -> List[str]:
-        """Extract column names from SQL text, preserving table prefixes"""
-        # Handle aggregate functions like min(frequency), max(frequency)
-        # Handle DISTINCT keyword
-        text = re.sub(r'\bdistinct\b', '', text, flags=re.IGNORECASE)
-        
-        # Simple regex to find column-like patterns
-        # Match patterns like table.col, col, aggregate_func(col), or "col"
-        # First, extract aggregate functions
-        agg_pattern = r'(min|max|sum|avg|count)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)'
-        agg_matches = re.findall(agg_pattern, text, re.IGNORECASE)
-        cols = []
-        for func, col_name in agg_matches:
-            # Store as "func(col)" for aggregate functions
-            cols.append(f"{func}({col_name})")
-        
-        # Remove aggregate functions from text to avoid double extraction
-        text_no_agg = re.sub(agg_pattern, '', text, flags=re.IGNORECASE)
-        
-        # Now extract regular columns
-        pattern = r'([a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)'
-        matches = re.findall(pattern, text_no_agg)
-        for match in matches:
-            table_prefix = match[0]  # e.g., "f." or "b."
-            col_name = match[1]  # e.g., "fsid"
-            # Filter out SQL keywords
-            keywords = {'select', 'from', 'where', 'group', 'by', 'having', 'order', 'limit', 
-                       'join', 'on', 'inner', 'left', 'right', 'full', 'outer', 'and', 'or', 'not',
-                       'as', 'count', 'sum', 'avg', 'max', 'min', 'distinct', 'in', 'union',
-                       'null', 'is', 'like', 'not'}
-            if col_name.lower() not in keywords and len(col_name) > 0:
-                # Preserve table prefix if present (e.g., "f.fsid" or just "fsid")
-                if table_prefix:
-                    cols.append(table_prefix.rstrip('.') + '.' + col_name)
-                else:
-                    cols.append(col_name)
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_cols = []
-        for col in cols:
-            if col not in seen:
-                unique_cols.append(col)
-                seen.add(col)
-        
-        return unique_cols
-    
-    def _find_line_range(self, query_text: str, token_idx: int, tokens) -> Tuple[int, int]:
-        """Find line range for a token"""
-        # Simplified: find position in text and convert to line
-        query_lines = query_text.split('\n')
-        return (0, len(query_lines) - 1)  # Placeholder
-    
-    def _find_line_range_for_text(self, query_text: str, char_pos: int) -> Tuple[int, int]:
-        """Find line range for a character position"""
-        if char_pos < 0 or char_pos >= len(query_text):
-            return (0, 0)
-        lines_before = query_text[:char_pos].split('\n')
-        line_num = len(lines_before) - 1
-        return (max(0, line_num), max(0, line_num))
-    
-    def _map_lines_to_steps(self, query_text: str, steps: List[Dict], line_count: int) -> Dict[int, int]:
-        """Map SQL line numbers to step indices"""
-        line_to_step = {}
-        query_lines = query_text.split('\n')
-        
-        # If no steps, return empty mapping
-        if not steps:
-            return line_to_step
-        
-        # Build a map of which steps start on which lines
-        steps_by_start_line = {}
-        for step_idx, step in enumerate(steps):
-            line_range = step.get('line_range', (0, line_count - 1))
-            start_line = line_range[0] if isinstance(line_range, tuple) and len(line_range) >= 2 else 0
-            start_line = max(0, min(start_line, line_count - 1))
-            
-            if start_line not in steps_by_start_line:
-                steps_by_start_line[start_line] = []
-            steps_by_start_line[start_line].append(step_idx)
-        
-        # For each line, find the step that should be active
-        # Strategy: show the result after executing all steps up to the step that starts on this line
-        # If multiple steps start on the same line, use the one with the lowest step index (first in execution order)
-        for line_idx in range(line_count):
-            # First, try to find a step that starts exactly on this line
-            if line_idx in steps_by_start_line:
-                # If multiple steps start on this line, use the one with lowest index (first in execution order)
-                step_idx = min(steps_by_start_line[line_idx])
-                line_to_step[line_idx] = step_idx
-            else:
-                # Find the step that starts on the closest previous line
-                best_step_idx = -1
-                best_start_line = -1
-                for start_line, step_indices in steps_by_start_line.items():
-                    if start_line < line_idx and start_line > best_start_line:
-                        best_start_line = start_line
-                        # Use the step with highest index from previous lines (most complete)
-                        best_step_idx = max(step_indices)
-                
-                if best_step_idx >= 0:
-                    line_to_step[line_idx] = best_step_idx
-                elif steps:
-                    # Default to first step if no step starts before this line
-                    line_to_step[line_idx] = 0
-        
-        return line_to_step
-    
-    def _execute_step(self, step_index: int, steps: List[Dict], query_id: str) -> Dict[str, Any]:
-        """Execute query up to a specific step and return visual state"""
-        # Get tables from graph builder
-        available_tables = {}
-        for table_name in self.graph_builder.table_rows.keys():
-            rows = self.graph_builder.get_table_rows(table_name)
-            if rows:
-                try:
-                    df = pd.DataFrame(rows)
-                    # Store with both original name and lowercase for case-insensitive matching
-                    # Store with original name (case-sensitive)
-                    available_tables[table_name] = df
-                    # Also store lowercase version for case-insensitive matching
-                    if table_name.lower() != table_name:
-                        available_tables[table_name.lower()] = df
-                except Exception as e:
-                    print(f"Warning: Could not create DataFrame for table {table_name}: {e}")
-                    continue
-        
-        if not available_tables:
-            return {
-                'input_tables': [],
-                'output_table': None,
-                'highlighted_cols': [],
-                'dimmed_rows': [],
-                'annotations': {},
-                'explanation_text': 'No tables available. Please upload data first.',
-                'step_type': 'error',
-                'before_row_count': 0,
-                'after_row_count': 0,
-                'join_condition': None
-            }
-        
-        # Build partial query up to this step
-        current_step = steps[step_index]
-        step_type = current_step['type']
-        
-        # Execute steps incrementally, building up the result
-        # First, execute all steps up to (but not including) the current step
-        # Then execute the current step
-        result_df = None
-        input_tables = []
-        highlighted_cols = []
-        dimmed_rows = []
-        explanation = current_step.get('description', f'Executing {step_type}')
-        join_condition = None
-        
-        # Execute all steps up to and including the current step
-        try:
-            # For SELECT_COL, we need to get the result from the last non-SELECT_COL step
-            if step_type == 'SELECT_COL':
-                # Find the last non-SELECT_COL step
-                prev_step_index = step_index - 1
-                while prev_step_index >= 0 and steps[prev_step_index].get('type') == 'SELECT_COL':
-                    prev_step_index -= 1
-                result_df = self._execute_steps_up_to(steps, prev_step_index, available_tables)
-            else:
-                # For other steps, execute up to the previous step
-                result_df = self._execute_steps_up_to(steps, step_index - 1, available_tables)
-            
-            # Now handle the current step
-            if step_type == 'FROM':
-                table_name = current_step.get('table')
-                if not table_name:
-                    raise ValueError("FROM step missing table name")
-                
-                # Try case-insensitive matching
-                table_name_lower = table_name.lower()
-                matched_table = None
-                # First try exact match
-                if table_name in available_tables:
-                    matched_table = table_name
-                elif table_name_lower in available_tables:
-                    matched_table = table_name_lower
-                else:
-                    # Try case-insensitive match
-                    for available_table in available_tables.keys():
-                        if available_table.lower() == table_name_lower:
-                            matched_table = available_table
-                            break
-                
-                if matched_table and matched_table in available_tables:
-                    result_df = available_tables[matched_table].copy()
-                    input_tables = [{
-                        'name': matched_table,
-                        'data': self._clean_for_json(result_df.head(50).to_dict('records')),
-                        'columns': list(result_df.columns),
-                        'row_count': len(result_df)
-                    }]
-                    explanation = f'Loaded table {matched_table} with {len(result_df)} rows'
-                else:
-                    available_table_names = ', '.join(list(available_tables.keys())[:5])
-                    raise ValueError(f"Table '{table_name}' not found. Available tables: {available_table_names}")
-            
-            elif step_type == 'JOIN':
-                # result_df already contains the result from previous steps
-                if result_df is None:
-                    raise ValueError("No previous result to join with")
-                
-                prev_result = result_df.copy()  # Save previous result for display
-                
-                join_table_name = current_step.get('table')
-                if not join_table_name:
-                    raise ValueError("JOIN step missing table name")
-                
-                # Case-insensitive matching for join table
-                join_table_name_lower = join_table_name.lower()
-                matched_join_table = None
-                for available_table in available_tables.keys():
-                    if available_table.lower() == join_table_name_lower:
-                        matched_join_table = available_table
-                        break
-                
-                if matched_join_table and matched_join_table in available_tables:
-                    join_table = available_tables[matched_join_table]
-                    
-                    # Show input tables
-                    from_step = next((s for s in steps if s.get('type') == 'FROM'), None)
-                    from_table_name = from_step['table'] if from_step and from_step.get('table') else 'base_table'
-                    input_tables = [
-                        {
-                            'name': from_table_name,
-                            'data': self._clean_for_json(prev_result.head(50).to_dict('records')),
-                            'columns': list(prev_result.columns),
-                            'row_count': len(prev_result)
-                        },
-                        {
-                            'name': matched_join_table,
-                            'data': self._clean_for_json(join_table.head(50).to_dict('records')),
-                            'columns': list(join_table.columns),
-                            'row_count': len(join_table)
-                        }
-                    ]
-                    
-                    # Perform join
-                    condition = current_step.get('condition', '')
-                    join_type = current_step.get('join_type', 'INNER JOIN')
-                    
-                    try:
-                        join_keys = self._parse_join_condition(condition, prev_result.columns, join_table.columns)
-                        if join_keys:
-                            left_key, right_key = join_keys
-                            how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                            result_df = prev_result.merge(join_table, left_on=left_key, right_on=right_key, how=how)
-                        else:
-                            # Fallback: try common column names
-                            common_cols = set(prev_result.columns) & set(join_table.columns)
-                            if common_cols:
-                                join_key = list(common_cols)[0]
-                                how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                result_df = prev_result.merge(join_table, on=join_key, how=how)
-                            else:
-                                how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                result_df = prev_result.merge(join_table, how=how, suffixes=('_left', '_right'))
-                    except Exception as e:
-                        # Fallback to simple merge
-                        common_cols = set(prev_result.columns) & set(join_table.columns)
-                        if common_cols:
-                            join_key = list(common_cols)[0]
-                            how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                            result_df = prev_result.merge(join_table, on=join_key, how=how)
-                        else:
-                            raise ValueError(f"Could not perform join: {str(e)}")
-                    
-                    join_condition = {'condition': condition, 'columns': self._extract_column_names(condition)}
-                    highlighted_cols = join_condition['columns']
-                    explanation = f'Joined {from_table_name} with {matched_join_table} ({len(result_df)} rows)'
-                else:
-                    available_table_names = ', '.join(list(available_tables.keys())[:5])
-                    raise ValueError(f"Join table '{join_table_name}' not found. Available tables: {available_table_names}")
-            
-            elif step_type == 'WHERE':
-                # result_df already contains the result from previous steps (FROM + JOIN)
-                if result_df is not None:
-                    before_count = len(result_df)
-                    
-                    # Show input table
-                    input_tables = [{
-                        'name': 'Before filter',
-                        'data': self._clean_for_json(result_df.head(50).to_dict('records')),
-                        'columns': list(result_df.columns),
-                        'row_count': len(result_df)
-                    }]
-                    
-                    # Try to actually filter - parse the WHERE condition
-                    condition = current_step.get('condition', '')
-                    highlighted_cols = current_step.get('columns', [])
-                    
-                    # Check for IN (SELECT ...) subqueries or multiple AND conditions with IN
-                    condition_lower = condition.lower()
-                    has_in_subquery = ' in (' in condition_lower and 'select' in condition_lower
-                    
-                    # Simple filtering - try to evaluate condition
-                    try:
-                        if has_in_subquery:
-                            # Handle IN subquery - may have multiple AND conditions
-                            # Split by AND to handle multiple conditions
-                            and_parts = condition.split(' and ')
-                            filtered_df = result_df.copy()
-                            
-                            for and_part in and_parts:
-                                and_part = and_part.strip()
-                                if ' in (' in and_part.lower() and 'select' in and_part.lower():
-                                    filtered_df = self._apply_where_filter_with_subquery(filtered_df, and_part, available_tables)
-                                else:
-                                    # Regular condition
-                                    filtered_df = self._apply_where_filter(filtered_df, and_part)
-                            
-                            result_df = filtered_df
-                            after_count = len(result_df)
-                            explanation = f'Filtered {before_count} rows to {after_count} rows using IN subquery'
-                        else:
-                            # For conditions with AND - split and apply each part
-                            # _apply_where_filter already handles AND splitting, but we need to ensure it works
-                            # Remove "where" keyword and semicolon if present in condition
-                            filter_condition = condition.strip()
-                            if filter_condition.lower().startswith('where'):
-                                filter_condition = filter_condition[5:].strip()
-                            if filter_condition.endswith(';'):
-                                filter_condition = filter_condition[:-1].strip()
-                            filtered_df = self._apply_where_filter(result_df, filter_condition)
-                            result_df = filtered_df
-                            after_count = len(result_df)
-                            dimmed_count = before_count - after_count
-                            explanation = f'Filtered {before_count} rows to {after_count} rows where {filter_condition}'
-                    except Exception as e:
-                        # If filtering fails, show error in explanation
-                        import traceback
-                        error_details = traceback.format_exc()
-                        print(f"WHERE filter error: {error_details}")
-                        explanation = f'Filtering rows where {condition}. Error: {str(e)}'
-                        dimmed_rows = []
-                        # Keep original result_df if filtering fails
-                        result_df = result_df if result_df is not None else None
-                else:
-                    explanation = 'No data to filter'
-            
-            elif step_type == 'SELECT_COL':
-                # Get result from all previous non-SELECT_COL steps
-                if result_df is None:
-                    # Find the last non-SELECT_COL step
-                    prev_step_index = step_index - 1
-                    while prev_step_index >= 0 and steps[prev_step_index].get('type') == 'SELECT_COL':
-                        prev_step_index -= 1
-                    if prev_step_index >= 0:
-                        result_df = self._execute_steps_up_to(steps, prev_step_index, available_tables)
-                
-                if result_df is not None and len(result_df) > 0:
-                    # Show input table (before column selection)
-                    input_tables = [{
-                        'name': 'Before projection',
-                        'data': self._clean_for_json(result_df.head(50).to_dict('records')),
-                        'columns': list(result_df.columns),
-                        'row_count': len(result_df)
-                    }]
-                    
-                    # Apply column selection incrementally
-                    selected_so_far = current_step.get('selected_so_far', [])
-                    if selected_so_far:
-                        final_cols = []
-                        for col in selected_so_far:
-                            col_name = col.split('.')[-1] if '.' in col else col
-                            
-                            if col_name in result_df.columns:
-                                final_cols.append(col_name)
-                            else:
-                                found = False
-                                for df_col in result_df.columns:
-                                    if df_col.lower() == col_name.lower():
-                                        final_cols.append(df_col)
-                                        found = True
-                                        break
-                                
-                                if not found:
-                                    for df_col in result_df.columns:
-                                        df_col_base = df_col.split('_')[0] if '_' in df_col else df_col
-                                        if df_col_base.lower() == col_name.lower():
-                                            final_cols.append(df_col)
-                                            found = True
-                                            break
-                        
-                        seen = set()
-                        unique_cols = []
-                        for col in final_cols:
-                            if col in result_df.columns and col not in seen:
-                                unique_cols.append(col)
-                                seen.add(col)
-                        
-                        if unique_cols:
-                            result_df = result_df[unique_cols]
-                            highlighted_cols = unique_cols
-                            column_name = current_step.get('column', '')
-                            explanation = f'Selected column: {column_name} ({len(result_df)} rows, {len(unique_cols)} columns)'
-                        else:
-                            explanation = f'Warning: Could not find selected columns {selected_so_far}'
-                    else:
-                        explanation = 'No columns to select'
-                elif result_df is not None and len(result_df) == 0:
-                    # Empty result after filtering - still show structure
-                    input_tables = [{
-                        'name': 'Before projection',
-                        'data': [],
-                        'columns': list(result_df.columns) if hasattr(result_df, 'columns') else [],
-                        'row_count': 0
-                    }]
-                    explanation = 'No rows match the filter conditions'
-                else:
-                    explanation = 'No data to select from'
-            
-            elif step_type == 'GROUP_BY':
-                # Get result from previous steps (FROM, JOIN, WHERE)
-                prev_result = self._execute_steps_up_to(steps, step_index - 1, available_tables)
-                if prev_result is not None:
-                    result_df = prev_result.copy()
-                    group_cols = current_step.get('columns', [])
-                    
-                    # Perform GROUP BY
-                    if group_cols:
-                        # Find actual column names
-                        actual_group_cols = []
-                        for col in group_cols:
-                            col_name = col.split('.')[-1] if '.' in col else col
-                            if col_name in result_df.columns:
-                                actual_group_cols.append(col_name)
-                            else:
-                                for df_col in result_df.columns:
-                                    if df_col.lower() == col_name.lower():
-                                        actual_group_cols.append(df_col)
-                                        break
-                        
-                        if actual_group_cols:
-                            # Group by columns - aggregations will be in SELECT
-                            result_df = result_df.groupby(actual_group_cols).first().reset_index()
-                    
-                    highlighted_cols = current_step.get('columns', [])
-                    explanation = f'Grouping by {", ".join(group_cols)}'
-                else:
-                    explanation = 'No data to group'
-            
-            elif step_type == 'HAVING':
-                # Get result from previous steps (FROM, JOIN, WHERE, GROUP BY)
-                prev_result = self._execute_steps_up_to(steps, step_index - 1, available_tables)
-                if prev_result is not None:
-                    result_df = prev_result.copy()
-                    condition = current_step.get('condition', '')
-                    
-                    # Apply HAVING filter
-                    try:
-                        filtered_df = self._apply_having_filter(result_df, condition)
-                        result_df = filtered_df
-                        explanation = f'Filtering groups where {condition}'
-                    except Exception as e:
-                        explanation = f'Filtering groups where {condition}. Error: {str(e)}'
-                    
-                    highlighted_cols = current_step.get('columns', [])
-                else:
-                    explanation = 'No data to filter'
-            
-            elif step_type == 'SELECT':
-                # Get result from all previous steps (FROM, JOIN, WHERE, etc.)
-                prev_result = self._execute_steps_up_to(steps, step_index - 1, available_tables)
-                if prev_result is not None:
-                    result_df = prev_result.copy()
-                    select_cols = current_step.get('columns', [])
-                    final_cols = []
-                    if select_cols:
-                        # Handle table prefixes (e.g., "f.fsid" -> "fsid", "b.bcode" -> "bcode")
-                        actual_cols = []
-                        for col in select_cols:
-                            # Remove table prefix if present (e.g., "f.fsid" -> "fsid")
-                            col_name = col.split('.')[-1] if '.' in col else col
-                            
-                            # Try exact match first
-                            if col_name in result_df.columns:
-                                actual_cols.append(col_name)
-                            else:
-                                # Try case-insensitive match
-                                found = False
-                                for df_col in result_df.columns:
-                                    if df_col.lower() == col_name.lower():
-                                        actual_cols.append(df_col)
-                                        found = True
-                                        break
-                                
-                                # If still not found, try partial match (for cases where join added suffixes)
-                                if not found:
-                                    for df_col in result_df.columns:
-                                        # Check if column name matches (ignoring suffixes like _x, _y)
-                                        df_col_base = df_col.split('_')[0] if '_' in df_col else df_col
-                                        if df_col_base.lower() == col_name.lower():
-                                            actual_cols.append(df_col)
-                                            found = True
-                                            break
-                        
-                        # Only select columns that exist - remove duplicates while preserving order
-                        seen = set()
-                        for col in actual_cols:
-                            if col in result_df.columns and col not in seen:
-                                final_cols.append(col)
-                                seen.add(col)
-                        
-                        if final_cols:
-                            result_df = result_df[final_cols]
-                        else:
-                            # If no matches found, this is an error - keep all columns for debugging
-                            explanation = f'Warning: Could not find selected columns {select_cols} in result. Showing all columns.'
-                    
-                    highlighted_cols = current_step.get('columns', [])
-                    # Remove table prefixes from highlighted cols for display
-                    highlighted_cols = [c.split('.')[-1] if '.' in c else c for c in highlighted_cols]
-                    explanation = f'Selected {len(final_cols) if final_cols else len(select_cols)} columns from result ({len(result_df)} rows)'
-                else:
-                    explanation = 'No data to select from'
-            
-            elif step_type == 'UNION':
-                # Execute both parts of the UNION
-                query1 = current_step.get('query1', '')
-                query2 = current_step.get('query2', '')
-                
-                try:
-                    # Execute first query
-                    parsed1 = sqlparse.parse(query1)
-                    result1 = None
-                    if parsed1 and parsed1[0]:
-                        steps1 = self._extract_steps(parsed1[0], query1)
-                        for s in steps1:
-                            if s['type'] == 'FROM':
-                                table_name = s.get('table')
-                                table_name_lower = table_name.lower()
-                                matched_table = None
-                                for available_table in available_tables.keys():
-                                    if available_table.lower() == table_name_lower:
-                                        matched_table = available_table
-                                        break
-                                if matched_table and matched_table in available_tables:
-                                    result1 = available_tables[matched_table].copy()
-                            elif s['type'] == 'WHERE' and result1 is not None:
-                                condition = s.get('condition', '')
-                                if ' in (' in condition.lower() and 'select' in condition.lower():
-                                    result1 = self._apply_where_filter_with_subquery(result1, condition, available_tables)
-                                else:
-                                    result1 = self._apply_where_filter(result1, condition)
-                            elif s['type'] == 'SELECT_COL' and result1 is not None:
-                                # Apply column selection
-                                selected_so_far = s.get('selected_so_far', [])
-                                if selected_so_far:
-                                    final_cols = []
-                                    for col in selected_so_far:
-                                        col_name = col.split('.')[-1] if '.' in col else col
-                                        if col_name in result1.columns:
-                                            final_cols.append(col_name)
-                                    if final_cols:
-                                        result1 = result1[final_cols]
-                    
-                    # Execute second query
-                    parsed2 = sqlparse.parse(query2)
-                    result2 = None
-                    if parsed2 and parsed2[0]:
-                        steps2 = self._extract_steps(parsed2[0], query2)
-                        for s in steps2:
-                            if s['type'] == 'FROM':
-                                table_name = s.get('table')
-                                table_name_lower = table_name.lower()
-                                matched_table = None
-                                for available_table in available_tables.keys():
-                                    if available_table.lower() == table_name_lower:
-                                        matched_table = available_table
-                                        break
-                                if matched_table and matched_table in available_tables:
-                                    result2 = available_tables[matched_table].copy()
-                            elif s['type'] == 'WHERE' and result2 is not None:
-                                condition = s.get('condition', '')
-                                result2 = self._apply_where_filter(result2, condition)
-                            elif s['type'] == 'SELECT_COL' and result2 is not None:
-                                # Apply column selection - need to map to first query's columns
-                                selected_so_far = s.get('selected_so_far', [])
-                                if selected_so_far:
-                                    final_cols = []
-                                    for col in selected_so_far:
-                                        col_name = col.split('.')[-1] if '.' in col else col
-                                        if col_name in result2.columns:
-                                            final_cols.append(col_name)
-                                    if final_cols:
-                                        result2 = result2[final_cols]
-                    
-                    # Union the results
-                    if result1 is not None and result2 is not None:
-                        # Align column names for UNION
-                        # For UNION, both queries should have same number of columns
-                        # Map second query columns to first query column names
-                        if len(result1.columns) == len(result2.columns):
-                            result2.columns = result1.columns
-                            result_df = pd.concat([result1, result2], ignore_index=True).drop_duplicates()
-                            explanation = f'Unioned {len(result1)} rows with {len(result2)} rows, result: {len(result_df)} rows'
-                            
-                            # Show both input tables
-                            input_tables = [
-                                {
-                                    'name': 'Query 1 result',
-                                    'data': self._clean_for_json(result1.head(50).to_dict('records')),
-                                    'columns': list(result1.columns),
-                                    'row_count': len(result1)
-                                },
-                                {
-                                    'name': 'Query 2 result',
-                                    'data': self._clean_for_json(result2.head(50).to_dict('records')),
-                                    'columns': list(result2.columns),
-                                    'row_count': len(result2)
-                                }
-                            ]
-                        else:
-                            explanation = f'UNION error: Column count mismatch ({len(result1.columns)} vs {len(result2.columns)})'
-                    elif result1 is not None:
-                        result_df = result1
-                        explanation = 'Union: Using first query result only'
-                    elif result2 is not None:
-                        result_df = result2
-                        explanation = 'Union: Using second query result only'
-                    else:
-                        explanation = 'Union: No results from either query'
-                except Exception as e:
-                    explanation = f'Error executing UNION: {str(e)}'
-                    import traceback
-                    traceback.print_exc()
-            
-            else:
-                # Unknown step type - use description from step
-                explanation = current_step.get('description', f'Processing {step_type} step')
-                if not result_df:
-                    # Try to get result from previous steps
-                    prev_result = self._execute_steps_up_to(steps, step_index - 1, available_tables)
-                    if prev_result is not None:
-                        result_df = prev_result.copy()
-            
-            # Prepare output table - always show the result
-            output_table = None
-            if result_df is not None and len(result_df) > 0:
-                output_table = {
-                    'data': self._clean_for_json(result_df.head(50).to_dict('records')),
-                    'columns': list(result_df.columns),
-                    'row_count': len(result_df)
-                }
-            elif result_df is not None and len(result_df) == 0:
-                # Empty result - still show the structure
-                output_table = {
-                    'data': [],
-                    'columns': list(result_df.columns) if hasattr(result_df, 'columns') else [],
-                    'row_count': 0
-                }
-            
-            # Calculate before/after counts
-            before_count = 0
-            if input_tables and len(input_tables) > 0:
-                before_count = input_tables[0].get('row_count', 0)
-            after_count = output_table['row_count'] if output_table else 0
-            
-            # Ensure explanation is always set - use step description as fallback
-            if not explanation or explanation == f'Executing {step_type}':
-                # Fallback to step description which should always be set
-                explanation = current_step.get('description', f'Processing {step_type} step')
-            
-            # Final fallback - should never reach here if steps are compiled correctly
-            if not explanation:
-                explanation = f'Executing {step_type} step'
-            
-            return {
-                'input_tables': input_tables,
-                'output_table': output_table,
-                'highlighted_cols': highlighted_cols,
-                'dimmed_rows': dimmed_rows,
-                'annotations': {},
-                'explanation_text': explanation,
-                'step_type': step_type,
-                'before_row_count': before_count,
-                'after_row_count': after_count,
-                'join_condition': join_condition
-            }
-        
-        except KeyError as e:
-            error_msg = f"Missing required field in step: {str(e)}"
-            # Try to preserve explanation if it was set
-            error_explanation = f'Error executing step: {error_msg}'
-            if 'explanation' in locals() and explanation:
-                error_explanation = f'{explanation}. Error: {error_msg}'
-            return {
-                'input_tables': [],
-                'output_table': None,
-                'highlighted_cols': [],
-                'dimmed_rows': [],
-                'annotations': {'error': error_msg},
-                'explanation_text': error_explanation,
-                'step_type': step_type if 'step_type' in locals() else 'error',
-                'before_row_count': 0,
-                'after_row_count': 0,
-                'join_condition': None
-            }
-        except Exception as e:
-            import traceback
-            error_details = str(e)
-            # Try to preserve explanation if it was set
-            error_explanation = f'Error executing step: {error_details}'
-            if 'explanation' in locals() and explanation:
-                error_explanation = f'{explanation}. Error: {error_details}'
-            elif 'current_step' in locals():
-                step_desc = current_step.get('description', f'Error in {step_type} step') if 'step_type' in locals() else 'Error executing step'
-                error_explanation = f'{step_desc}. Error: {error_details}'
-            return {
-                'input_tables': [],
-                'output_table': None,
-                'highlighted_cols': [],
-                'dimmed_rows': [],
-                'annotations': {'error': error_details},
-                'explanation_text': error_explanation,
-                'step_type': step_type if 'step_type' in locals() else 'error',
-                'before_row_count': 0,
-                'after_row_count': 0,
-                'join_condition': None
-            }
-        finally:
-            if 'conn' in locals() and conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-    
-    def _execute_steps_up_to(self, steps: List[Dict], max_step_index: int, available_tables: Dict) -> Optional[pd.DataFrame]:
-        """Execute steps up to a given index and return the result DataFrame"""
-        result_df = None
-        
-        for i in range(max_step_index + 1):
-            if i >= len(steps):
-                break
-            step = steps[i]
-            step_type = step['type']
-            
-            # Skip SELECT_COL steps in _execute_steps_up_to - they're handled separately
-            if step_type == 'SELECT_COL':
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token.ttype is Keyword and token.value.upper() == 'FROM':
+                from_seen = True
+                i += 1
                 continue
             
-            if step_type == 'FROM':
-                table_name = step.get('table')
-                if table_name:
-                    # Case-insensitive matching
-                    table_name_lower = table_name.lower()
-                    matched_table = None
-                    for available_table in available_tables.keys():
-                        if available_table.lower() == table_name_lower:
-                            matched_table = available_table
-                            break
-                    if matched_table and matched_table in available_tables:
-                        result_df = available_tables[matched_table].copy()
-            
-            elif step_type == 'JOIN' and result_df is not None:
-                join_table_name = step.get('table')
-                if join_table_name:
-                    # Case-insensitive matching
-                    join_table_name_lower = join_table_name.lower()
-                    matched_join_table = None
-                    for available_table in available_tables.keys():
-                        if available_table.lower() == join_table_name_lower:
-                            matched_join_table = available_table
-                            break
-                    if matched_join_table and matched_join_table in available_tables:
-                        join_table = available_tables[matched_join_table]
-                        condition = step.get('condition', '')
-                        join_type = step.get('join_type', 'INNER JOIN')
-                        
-                        # Parse join condition to find join keys
-                        try:
-                            join_keys = self._parse_join_condition(condition, result_df.columns, join_table.columns)
-                            if join_keys:
-                                left_key, right_key = join_keys
-                                how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                result_df = result_df.merge(join_table, left_on=left_key, right_on=right_key, how=how)
-                            else:
-                                # Fallback: try common column names
-                                common_cols = set(result_df.columns) & set(join_table.columns)
-                                if common_cols:
-                                    join_key = list(common_cols)[0]
-                                    how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                    result_df = result_df.merge(join_table, on=join_key, how=how)
-                                else:
-                                    how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                    result_df = result_df.merge(join_table, how=how, suffixes=('_left', '_right'))
-                        except Exception:
-                            # Fallback to simple merge
-                            common_cols = set(result_df.columns) & set(join_table.columns)
-                            if common_cols:
-                                join_key = list(common_cols)[0]
-                                how = 'left' if 'LEFT' in join_type.upper() else 'inner'
-                                result_df = result_df.merge(join_table, on=join_key, how=how)
-            
-            elif step_type == 'WHERE' and result_df is not None:
-                condition = step.get('condition', '')
-                try:
-                    result_df = self._apply_where_filter(result_df, condition)
-                except Exception as e:
-                    print(f"Warning: WHERE filter failed in _execute_steps_up_to: {e}")
-                    pass  # If filtering fails, keep original
-            
-            elif step_type == 'GROUP_BY' and result_df is not None:
-                group_cols = step.get('columns', [])
-                if group_cols:
-                    actual_group_cols = []
-                    for col in group_cols:
-                        col_name = col.split('.')[-1] if '.' in col else col
-                        if col_name in result_df.columns:
-                            actual_group_cols.append(col_name)
-                        else:
-                            for df_col in result_df.columns:
-                                if df_col.lower() == col_name.lower():
-                                    actual_group_cols.append(df_col)
-                                    break
-                    
-                    if actual_group_cols:
-                        # Group by columns - aggregations will be in SELECT
-                        result_df = result_df.groupby(actual_group_cols).first().reset_index()
-            
-            elif step_type == 'HAVING' and result_df is not None:
-                condition = step.get('condition', '')
-                try:
-                    result_df = self._apply_having_filter(result_df, condition)
-                except Exception as e:
-                    print(f"Warning: HAVING filter failed in _execute_steps_up_to: {e}")
-                    pass  # If filtering fails, keep original
-            
-            elif step_type == 'SELECT_COL' and result_df is not None:
-                # For SELECT_COL steps, incrementally add columns
-                selected_so_far = step.get('selected_so_far', [])
-                if selected_so_far:
-                    final_cols = []
-                    for col in selected_so_far:
-                        col_name = col.split('.')[-1] if '.' in col else col
-                        
-                        if col_name in result_df.columns:
-                            final_cols.append(col_name)
-                        else:
-                            found = False
-                            for df_col in result_df.columns:
-                                if df_col.lower() == col_name.lower():
-                                    final_cols.append(df_col)
-                                    found = True
-                                    break
+            if from_seen:
+                if token.ttype is Keyword and token.value.upper() in stop_keywords:
+                    break
+                if token.is_whitespace or token.value.strip() in [',', '.', '(', ')']:
+                    i += 1
+                    continue
+                
+                if (token.ttype is None or token.ttype is Name) and token.value.strip():
+                    value = self._clean_identifier(token.value)
+                    if value and value.upper() not in ['INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'JOIN', 'ON', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'AS']:
+                        # Check if this is a table name (longer than 1 char) or potential alias
+                        if len(value) > 1:
+                            # Check if next non-whitespace token is a single-letter alias
+                            j = i + 1
+                            while j < len(tokens) and tokens[j].is_whitespace:
+                                j += 1
                             
-                            if not found:
-                                for df_col in result_df.columns:
-                                    df_col_base = df_col.split('_')[0] if '_' in df_col else df_col
-                                    if df_col_base.lower() == col_name.lower():
-                                        final_cols.append(df_col)
-                                        found = True
-                                        break
-                    
-                    seen = set()
-                    unique_cols = []
-                    for col in final_cols:
-                        if col in result_df.columns and col not in seen:
-                            unique_cols.append(col)
-                            seen.add(col)
-                    
-                    if unique_cols:
-                        result_df = result_df[unique_cols]
+                            if j < len(tokens):
+                                next_token = tokens[j]
+                                if ((next_token.ttype is None or next_token.ttype is Name) and
+                                    len(next_token.value.strip()) == 1 and 
+                                    next_token.value.strip().isalpha()):
+                                    # This is a table name followed by an alias
+                                    alias = next_token.value.strip()
+                                    if value not in tables:
+                                        tables.append(value)
+                                    table_aliases[value] = alias
+                                    i = j + 1  # Skip table, whitespace, and alias
+                                    continue
+                            
+                            # No alias found, just table name
+                            if value not in tables:
+                                tables.append(value)
+                        elif len(value) == 1 and value.isalpha():
+                            # Single letter - might be an alias, but we already handled it above
+                            pass
+            i += 1
         
-        return result_df
+        return tables, table_aliases
     
-    def _parse_join_condition(self, condition: str, left_cols: List[str], right_cols: List[str]) -> Optional[Tuple[str, str]]:
-        """Parse join condition like 'f.fsid = b.fsid' and return (left_key, right_key)"""
-        if not condition:
-            return None
+    def _extract_joins(self, parsed) -> List[Dict[str, Any]]:
+        """Extract JOIN clauses."""
+        joins = []
+        tokens = list(parsed.flatten())
         
-        # Simple pattern matching for "table.col = table.col"
-        pattern = r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)'
-        match = re.search(pattern, condition)
-        if match:
-            left_table, left_col = match.group(1), match.group(2)
-            right_table, right_col = match.group(3), match.group(4)
+        DebugLogger.log("_extract_joins: scanning {} tokens", len(tokens))
+        
+        # Debug: log tokens around FROM and expected JOIN locations - show more context
+        from_idx = None
+        for idx, tok in enumerate(tokens):
+            if tok.value.upper() == 'FROM':
+                from_idx = idx
+                break
+        
+        if from_idx is not None:
+            # Log tokens from FROM onwards (about 30 tokens to see JOIN structure)
+            end_idx = min(from_idx + 30, len(tokens))
+            DebugLogger.log("_extract_joins: tokens from FROM (index {}) to {}:", from_idx, end_idx)
+            for idx in range(from_idx, end_idx):
+                tok = tokens[idx]
+                DebugLogger.log("  token {}: value={}, ttype={}, is_whitespace={}", 
+                              idx, repr(tok.value), tok.ttype, tok.is_whitespace)
+        else:
+            # Fallback: log tokens with keywords
+            for idx, tok in enumerate(tokens):
+                tok_val_upper = tok.value.upper()
+                if tok_val_upper in ['FROM', 'LEFT', 'RIGHT', 'JOIN', 'ON'] or (tok_val_upper and any(kw in tok_val_upper for kw in ['LEFT', 'JOIN'])):
+                    DebugLogger.log("_extract_joins: token {}: value='{}', ttype={}, is_whitespace={}", 
+                                  idx, repr(tok.value), tok.ttype, tok.is_whitespace)
+        
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            token_value = token.value.upper()
             
-            # Find matching columns (remove table prefix)
-            if left_col in left_cols:
-                left_key = left_col
+            # Check if this token could be part of a JOIN (LEFT, RIGHT, INNER, FULL, or JOIN itself)
+            # sqlparse may not always mark these as Keyword tokens, so check the value too
+            # Also check for compound tokens like "LEFT JOIN" in a single token
+            is_keyword = token.ttype is Keyword
+            is_join_related = (token_value in ['LEFT', 'RIGHT', 'INNER', 'FULL', 'OUTER', 'JOIN'] or
+                              any(jt in token_value for jt in ['LEFT', 'RIGHT', 'INNER', 'FULL']) and 'JOIN' in token_value)
+            
+            if is_join_related:
+                DebugLogger.log("_extract_joins: found join-related token at {}: value='{}', ttype={}, is_keyword={}", 
+                              i, token.value, token.ttype, is_keyword)
+            
+            if not is_keyword and not is_join_related:
+                i += 1
+                continue
+            
+            # Try to parse join type from this position
+            join_type = self._parse_join_type(tokens, i)
+            if join_type is None:
+                if is_join_related:
+                    DebugLogger.log("_extract_joins: join-related token '{}' at {} did not parse as join type", token.value, i)
+                i += 1
+                continue
+            
+            DebugLogger.log("_extract_joins: found join_type={} at token {}: {}", join_type, i, token.value)
+            
+            # Extract table name, alias, and ON condition
+            table_name, table_alias, on_condition, join_columns, next_idx = self._extract_join_details(tokens, i)
+            
+            if table_name:
+                joins.append({
+                    'type': join_type,
+                    'right_table': table_name,
+                    'right_table_alias': table_alias,
+                    'condition': on_condition or '',
+                    'columns': list(set(join_columns)) if join_columns else []
+                })
+                DebugLogger.log("Found JOIN - type={}, table={}, condition={}", join_type, table_name, on_condition)
+                i = next_idx
             else:
-                left_key = next((c for c in left_cols if c.endswith('.' + left_col) or c == left_col), None)
+                DebugLogger.log("_extract_joins: join_type found but no table_name extracted at token {}", i)
+                i += 1
+        
+        return joins
+    
+    def _parse_join_type(self, tokens: List, start_idx: int) -> Optional[str]:
+        """Parse join type from tokens starting at start_idx."""
+        token = tokens[start_idx]
+        value = token.value.upper()
+        
+        # Check if value contains both join type and JOIN (e.g., "LEFT JOIN" as single token)
+        if 'LEFT' in value and 'JOIN' in value:
+            return 'LEFT'
+        if 'RIGHT' in value and 'JOIN' in value:
+            return 'RIGHT'
+        if 'INNER' in value and 'JOIN' in value:
+            return 'INNER'
+        if 'FULL' in value and 'JOIN' in value:
+            return 'FULL'
+        
+        if value in ['INNER', 'LEFT', 'RIGHT', 'FULL']:
+            join_type = value
+            # Skip whitespace tokens to find JOIN keyword
+            next_idx = start_idx + 1
+            while next_idx < len(tokens) and tokens[next_idx].is_whitespace:
+                next_idx += 1
             
-            if right_col in right_cols:
-                right_key = right_col
-            else:
-                right_key = next((c for c in right_cols if c.endswith('.' + right_col) or c == right_col), None)
-            
-            if left_key and right_key:
-                return (left_key, right_key)
+            if next_idx < len(tokens):
+                next_token = tokens[next_idx]
+                next_token_val = next_token.value.upper()
+                DebugLogger.log("_parse_join_type: found '{}' at {}, next token at {}: value='{}', ttype={}", 
+                              value, start_idx, next_idx, repr(next_token.value), next_token.ttype)
+                if next_token_val == 'JOIN' or 'JOIN' in next_token_val:
+                    DebugLogger.log("_parse_join_type: returning join_type='{}'", join_type)
+                    return join_type
+                elif next_token_val == 'OUTER':
+                    # Skip whitespace after OUTER
+                    outer_next_idx = next_idx + 1
+                    while outer_next_idx < len(tokens) and tokens[outer_next_idx].is_whitespace:
+                        outer_next_idx += 1
+                    if outer_next_idx < len(tokens) and tokens[outer_next_idx].value.upper() == 'JOIN':
+                        return f"{join_type} OUTER"
+        elif value == 'JOIN' or 'JOIN' in value:
+            # Check backwards for LEFT/RIGHT/FULL
+            prev_idx = start_idx - 1
+            while prev_idx >= 0 and tokens[prev_idx].is_whitespace:
+                prev_idx -= 1
+            if prev_idx >= 0:
+                prev_val = tokens[prev_idx].value.upper()
+                if prev_val in ['LEFT', 'RIGHT', 'FULL', 'INNER']:
+                    return prev_val
+            return 'INNER'
+        elif value == 'OUTER':
+            # Check backwards for LEFT/RIGHT/FULL, forwards for JOIN
+            prev_idx = start_idx - 1
+            while prev_idx >= 0 and tokens[prev_idx].is_whitespace:
+                prev_idx -= 1
+            if prev_idx >= 0 and tokens[prev_idx].value.upper() in ['LEFT', 'RIGHT', 'FULL']:
+                # Check forwards for JOIN
+                next_idx = start_idx + 1
+                while next_idx < len(tokens) and tokens[next_idx].is_whitespace:
+                    next_idx += 1
+                if next_idx < len(tokens) and tokens[next_idx].value.upper() == 'JOIN':
+                    return f"{tokens[prev_idx].value.upper()} OUTER"
         
         return None
     
-    def _apply_where_filter(self, df: pd.DataFrame, condition: str) -> pd.DataFrame:
-        """Apply a WHERE filter condition to a DataFrame"""
-        if not condition:
-            return df
+    def _extract_join_details(self, tokens: List, start_idx: int) -> tuple:
+        """Extract table name, alias, ON condition, and columns from JOIN tokens."""
+        table_name = None
+        table_alias = None
+        on_condition = None
+        join_columns = []
         
-        # Remove "where" keyword if present
-        condition = condition.strip()
-        if condition.upper().startswith('WHERE'):
-            condition = condition[5:].strip()
-        # Remove trailing semicolon if present
-        if condition.endswith(';'):
-            condition = condition[:-1].strip()
-        
-        print(f"DEBUG WHERE: Full condition after strip: '{condition}'")
-        print(f"DEBUG WHERE: Input dataframe has {len(df)} rows")
-        
-        # Split by ' and ' first to handle AND conditions
-        # Then handle OR within each AND group
-        # Use case-insensitive split to handle "AND" or "and"
-        and_parts = re.split(r'\s+and\s+', condition, flags=re.IGNORECASE)
-        print(f"DEBUG WHERE: Split into {len(and_parts)} AND parts: {and_parts}")
-        filtered_df = df.copy()
-        
-        for and_part in and_parts:
-            and_part = and_part.strip()
-            if not and_part:
+        # Find table name and alias
+        j = start_idx + 1
+        while j < len(tokens):
+            token_j = tokens[j]
+            if token_j.is_whitespace:
+                j += 1
                 continue
-            print(f"DEBUG WHERE: Processing AND part: '{and_part}'")
-            # Check for OR conditions within this AND part
-            if ' or ' in and_part.lower():
-                # Handle OR - at least one condition must be true
-                or_parts = re.split(r'\s+or\s+', and_part, flags=re.IGNORECASE)
-                or_mask = pd.Series([False] * len(filtered_df))
-                for or_cond in or_parts:
-                    or_cond = or_cond.strip()
-                    if or_cond:
-                        or_mask = or_mask | self._evaluate_condition(filtered_df, or_cond)
-                filtered_df = filtered_df[or_mask]
-                print(f"DEBUG WHERE: After OR, {len(filtered_df)} rows remain")
-            else:
-                # Handle single AND condition - apply filter sequentially
-                before_count = len(filtered_df)
-                try:
-                    filtered_df = self._evaluate_condition(filtered_df, and_part, return_df=True)
-                    after_count = len(filtered_df)
-                    print(f"DEBUG WHERE: After '{and_part}', {before_count} -> {after_count} rows")
-                except Exception as e:
-                    print(f"DEBUG WHERE: Error evaluating condition '{and_part}': {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Return empty dataframe on error
-                    filtered_df = filtered_df.iloc[0:0]
-                    after_count = 0
-                    print(f"DEBUG WHERE: After error, {before_count} -> {after_count} rows")
-        
-        return filtered_df
-    
-    def _evaluate_condition(self, df: pd.DataFrame, condition: str, return_df: bool = False) -> pd.DataFrame:
-        """Evaluate a single condition and return filtered DataFrame or boolean Series"""
-        cond = condition.strip()
-        
-        # Handle IS NULL / IS NOT NULL
-        if ' is null' in cond.lower() or ' is not null' in cond.lower():
-            pattern = r'(\w+\.)?(\w+)\s+is\s+(not\s+)?null'
-            match = re.search(pattern, cond, re.IGNORECASE)
-            if match:
-                col_name = match.group(2)
-                is_not = match.group(3) is not None
-                
-                # Find column
-                col = None
-                if col_name in df.columns:
-                    col = df[col_name]
+            # Stop at ON or other SQL keywords, or if we hit another JOIN
+            if token_j.ttype is Keyword:
+                token_val_upper = token_j.value.upper()
+                if token_val_upper in ['ON', 'WHERE', 'GROUP', 'ORDER', 'HAVING']:
+                    break
+                # Also stop if we hit another JOIN keyword
+                if ('JOIN' in token_val_upper or 
+                    token_val_upper in ['LEFT', 'RIGHT', 'INNER', 'FULL']):
+                    break
+            if (token_j.ttype is None or token_j.ttype is Name) and not token_j.is_whitespace:
+                value = self._clean_identifier(token_j.value)
+                if not table_name:
+                    table_name = value
+                    # Check if next non-whitespace token is a single-letter alias
+                    k = j + 1
+                    while k < len(tokens) and tokens[k].is_whitespace:
+                        k += 1
+                    
+                    if k < len(tokens):
+                        next_token = tokens[k]
+                        if ((next_token.ttype is None or next_token.ttype is Name) and
+                            len(next_token.value.strip()) == 1 and 
+                            next_token.value.strip().isalpha()):
+                            table_alias = next_token.value.strip()
+                            j = k  # Skip to alias token position
+                elif len(value) == 1 and value.isalpha():
+                    break
                 else:
-                    for df_col in df.columns:
-                        if df_col.lower() == col_name.lower():
-                            col = df[df_col]
-                            break
-                
-                if col is not None:
-                    mask = col.isna() if not is_not else col.notna()
-                    return df[mask] if return_df else mask
+                    break
+            j += 1
         
-        # Handle LIKE / NOT LIKE
-        if ' like ' in cond.lower() or ' not like ' in cond.lower():
-            # Pattern to match: column [NOT] LIKE "pattern" or 'pattern'
-            # Examples: cid like "%bank%", company not like "%bank%"
-            # Try with quotes first (most common case)
-            pattern = r'(\w+\.)?(\w+)\s+(not\s+)?like\s+(["\'])(.*?)\4'
-            match = re.search(pattern, cond, re.IGNORECASE)
+        # Find ON condition
+        j = start_idx + 1
+        on_seen = False
+        condition_parts = []
+        stop_keywords = ['GROUP', 'WHERE', 'ORDER', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'FULL']
+        
+        while j < len(tokens):
+            token_j = tokens[j]
+            token_value_upper = token_j.value.upper() if not token_j.is_whitespace else ''
             
-            if match:
-                col_name = match.group(2)
-                is_not = match.group(3) is not None
-                pattern_str = match.group(5)  # Pattern without quotes
-            else:
-                # Try without quotes (unquoted pattern like: cid like %bank%)
-                pattern = r'(\w+\.)?(\w+)\s+(not\s+)?like\s+([^\s;,\)]+)'
-                match = re.search(pattern, cond, re.IGNORECASE)
-                if match:
-                    col_name = match.group(2)
-                    is_not = match.group(3) is not None
-                    pattern_str = match.group(4).strip('"\'')
+            # Stop if we hit another JOIN (LEFT JOIN, RIGHT JOIN, INNER JOIN, etc.)
+            # Check for compound JOIN tokens like "left join" or standalone JOIN keywords
+            if (token_j.ttype is Keyword and 
+                (token_value_upper == 'JOIN' or 
+                 'JOIN' in token_value_upper or
+                 token_value_upper in ['LEFT', 'RIGHT', 'INNER', 'FULL', 'OUTER'])):
+                # Check if this is a JOIN keyword (not part of current join's ON condition)
+                if on_seen:
+                    # We've seen ON, so this is the start of the next JOIN
+                    break
+                # If we haven't seen ON yet, this might be a standalone JOIN keyword, skip it for now
+                if token_value_upper == 'JOIN' and not on_seen:
+                    break
+            
+            if token_j.ttype is Keyword and token_j.value.upper() == 'ON':
+                on_seen = True
+                j += 1
+                continue
+            
+            if on_seen:
+                # Stop if we hit another JOIN (LEFT JOIN, RIGHT JOIN, INNER JOIN, etc.)
+                # Check for compound JOIN tokens like "left join" or standalone JOIN keywords
+                if token_j.ttype is Keyword:
+                    # Check if this token contains or is a JOIN keyword
+                    is_join_keyword = (token_value_upper in ['JOIN', 'LEFT', 'RIGHT', 'INNER', 'FULL', 'OUTER'] or 
+                                       'JOIN' in token_value_upper or
+                                       (any(kw in token_value_upper for kw in ['LEFT', 'RIGHT', 'INNER', 'FULL']) and 'JOIN' in token_value_upper))
+                    if is_join_keyword:
+                        # This is the start of the next JOIN, stop here
+                        DebugLogger.log("_extract_join_details: stopping ON condition extraction at token {} (next JOIN detected: '{}')", j, token_j.value)
+                        break
+                    
+                    # Stop at other SQL keywords
+                    if token_value_upper == 'GROUP' or token_value_upper.startswith('GROUP'):
+                        break
+                    if token_value_upper in stop_keywords:
+                        break
+                
+                if 'GROUP' in token_value_upper or 'BY' in token_value_upper:
+                    if token_j.ttype is Keyword:
+                        break
+                
+                if token_j.is_whitespace:
+                    condition_parts.append(' ')
                 else:
-                    # Pattern didn't match - log and return empty (shouldn't happen for valid SQL)
-                    print(f"DEBUG LIKE: Pattern did not match condition: '{cond}'")
-                    print(f"DEBUG LIKE: Tried patterns: quoted and unquoted")
-                    # Return empty result if pattern doesn't match (safer than returning all rows)
-                    return df.iloc[0:0] if return_df else pd.Series([False] * len(df))
-            
-            # Find column in dataframe
-            col = None
-            if col_name in df.columns:
-                col = df[col_name]
-            else:
-                # Case-insensitive search
-                for df_col in df.columns:
-                    if df_col.lower() == col_name.lower():
-                        col = df[df_col]
-                        break
-            
-            if col is not None:
-                # Convert SQL LIKE pattern to regex
-                # % matches any sequence (0 or more chars), _ matches single character
-                # Example: "%bank%" -> ".*bank.*"
-                # Strategy: Use simple placeholders that won't appear in patterns
-                placeholder_percent = 'XXXPERCENTXXX'
-                placeholder_underscore = 'XXXUNDERSCOREXXX'
-                
-                # Replace % and _ with placeholders BEFORE escaping
-                temp_pattern = pattern_str.replace('%', placeholder_percent).replace('_', placeholder_underscore)
-                # Escape all regex special characters
-                escaped_pattern = re.escape(temp_pattern)
-                # Restore % and _ as regex patterns AFTER escaping
-                regex_pattern = escaped_pattern.replace(placeholder_percent, '.*').replace(placeholder_underscore, '.')
-                
-                # Debug output
-                print(f"DEBUG LIKE: col_name={col_name}, pattern_str={pattern_str}, regex_pattern={regex_pattern}, is_not={is_not}")
-                print(f"DEBUG LIKE: Sample values: {col.head(10).tolist()}")
-                
-                # Apply the pattern
-                mask = col.astype(str).str.contains(regex_pattern, case=False, na=False, regex=True)
-                print(f"DEBUG LIKE: Mask matches: {mask.sum()} out of {len(mask)}")
-                if is_not:
-                    mask = ~mask
-                    print(f"DEBUG LIKE: After NOT, matches: {mask.sum()} out of {len(mask)}")
-                return df[mask] if return_df else mask
-            else:
-                # Column not found - log and return empty
-                print(f"DEBUG LIKE: Column '{col_name}' not found in dataframe. Available columns: {list(df.columns)}")
-                return df.iloc[0:0] if return_df else pd.Series([False] * len(df))
+                    condition_parts.append(token_j.value)
+            j += 1
         
-        # Handle arithmetic expressions (e.g., "start_hour + duration > 17")
-        if '+' in cond or '-' in cond or '*' in cond or '/' in cond:
-            # Try to parse arithmetic expression
-            # Pattern: col1 + col2 > value or col1 - col2 < value
-            pattern = r'(\w+\.)?(\w+)\s*([+\-*/])\s*(\w+\.)?(\w+)\s*(<|>|<=|>=|=|!=)\s*([\d\w\'"]+)'
-            match = re.search(pattern, cond)
-            if match:
-                col1_name = match.group(2)
-                operator = match.group(3)
-                col2_name = match.group(5)
-                comparison = match.group(6)
-                value_str = match.group(7).strip('\'"')
-                
-                # Find columns
-                col1 = None
-                col2 = None
-                for df_col in df.columns:
-                    if df_col.lower() == col1_name.lower():
-                        col1 = df[df_col]
-                    if df_col.lower() == col2_name.lower():
-                        col2 = df[df_col]
-                
-                if col1 is not None and col2 is not None:
-                    # Perform arithmetic
-                    if operator == '+':
-                        result = col1 + col2
-                    elif operator == '-':
-                        result = col1 - col2
-                    elif operator == '*':
-                        result = col1 * col2
-                    elif operator == '/':
-                        result = col1 / col2
-                    else:
-                        return df if return_df else pd.Series([True] * len(df))
-                    
-                    # Convert value
-                    try:
-                        value = float(value_str) if '.' in value_str else int(value_str)
-                    except:
-                        value = value_str
-                    
-                    # Apply comparison
-                    if comparison == '<':
-                        mask = result < value
-                    elif comparison == '>':
-                        mask = result > value
-                    elif comparison == '<=':
-                        mask = result <= value
-                    elif comparison == '>=':
-                        mask = result >= value
-                    elif comparison == '=':
-                        mask = result == value
-                    elif comparison == '!=':
-                        mask = result != value
-                    else:
-                        return df if return_df else pd.Series([True] * len(df))
-                    
-                    return df[mask] if return_df else mask
+        if condition_parts:
+            on_condition = re.sub(r'\s+', ' ', ''.join(condition_parts).strip())
+            # Extract columns from the full condition string for comprehensive coverage
+            if on_condition:
+                extracted_cols = self._extract_columns_from_join_condition(on_condition)
+                for col in extracted_cols:
+                    if col not in join_columns:
+                        join_columns.append(col)
         
-        # Handle simple comparisons: col < value, col > value, etc.
-        pattern = r'(\w+\.)?(\w+)\s*(<|>|<=|>=|=|!=)\s*([\d\w\'"]+)'
-        match = re.search(pattern, cond)
-        if match:
-            col_name = match.group(2)
-            operator = match.group(3)
-            value_str = match.group(4).strip('\'"')
-            
-            # Find the column in dataframe
-            col = None
-            if col_name in df.columns:
-                col = df[col_name]
-            else:
-                # Try case-insensitive match
-                for df_col in df.columns:
-                    if df_col.lower() == col_name.lower():
-                        col = df[df_col]
-                        break
-            
-            if col is None:
-                # Column not found - return original dataframe
-                return df if return_df else pd.Series([True] * len(df))
-            
-            # Try to convert value to appropriate type
-            try:
-                if value_str.replace('.', '').replace('-', '').isdigit():
-                    value = float(value_str) if '.' in value_str else int(value_str)
-                else:
-                    value = value_str
-            except:
-                value = value_str
-            
-            # Apply filter
-            if operator == '<':
-                mask = col < value
-            elif operator == '>':
-                mask = col > value
-            elif operator == '<=':
-                mask = col <= value
-            elif operator == '>=':
-                mask = col >= value
-            elif operator == '=':
-                mask = col == value
-            elif operator == '!=':
-                mask = col != value
-            else:
-                return df if return_df else pd.Series([True] * len(df))
-            
-            return df[mask] if return_df else mask
-        
-        # If no pattern matched, return original dataframe
-        return df if return_df else pd.Series([True] * len(df))
+        return table_name, table_alias, on_condition, join_columns, j
     
-    def _extract_union_steps(self, query1: str, query2: str, full_query: str) -> List[Dict[str, Any]]:
-        """Extract steps for a UNION query"""
-        steps = []
+    def _extract_where(self, parsed) -> Optional[Dict[str, Any]]:
+        """Extract WHERE clause."""
+        where_seen = False
+        condition_parts = []
+        condition_str = ''
         
-        # Parse first query
-        parsed1 = sqlparse.parse(query1)
-        if parsed1 and parsed1[0]:
-            steps1 = self._extract_steps(parsed1[0], query1)
-            steps.extend(steps1)
+        for token in parsed.flatten():
+            if token.ttype is Keyword and token.value.upper() == KEYWORD_WHERE:
+                where_seen = True
+                continue
+            if where_seen:
+                token_upper = token.value.upper()
+                # Stop when we hit the start of GROUP BY / HAVING / ORDER BY clauses,
+                # even if sqlparse doesn't mark them as separate Keyword tokens.
+                if (
+                    (token.ttype is Keyword and token_upper in [KEYWORD_GROUP, KEYWORD_ORDER, KEYWORD_HAVING])
+                    or f'{KEYWORD_GROUP} {KEYWORD_BY}' in token_upper
+                    or KEYWORD_HAVING in token_upper
+                    or f'{KEYWORD_ORDER} {KEYWORD_BY}' in token_upper
+                ):
+                    break
+                condition_parts.append(token.value)
         
-        # Add UNION step
-        union_idx = full_query.lower().find(' union ')
-        steps.append({
-            'type': 'UNION',
-            'query1': query1,
-            'query2': query2,
-            'line_range': self._find_line_range_for_text(full_query, union_idx),
-            'description': 'Union with second query'
-        })
-        
-        # Parse second query
-        parsed2 = sqlparse.parse(query2)
-        if parsed2 and parsed2[0]:
-            steps2 = self._extract_steps(parsed2[0], query2)
-            # Adjust step indices for second query
-            for step in steps2:
-                step['union_part'] = 2  # Mark as second part of union
-            steps.extend(steps2)
-        
-        return steps
+        if condition_parts:
+            condition_str = ' '.join(condition_parts)
+            DebugLogger.log("WHERE condition extracted: {}", condition_str)
+            # Extract columns from the full condition string for comprehensive coverage
+            where_columns = self._extract_columns_from_condition(condition_str, is_having=False)
+            DebugLogger.log("WHERE columns extracted: {}", where_columns)
+            return {
+                'condition': condition_str,
+                'columns': where_columns
+            }
+        return None
     
-    def _apply_where_filter_with_subquery(self, df: pd.DataFrame, condition: str, available_tables: Dict) -> pd.DataFrame:
-        """Apply WHERE filter with IN (SELECT ...) subquery"""
-        if not condition:
-            return df
+    def _extract_group_by(self, parsed) -> Optional[List[str]]:
+        """Extract GROUP BY columns."""
+        group_by_seen = False
+        by_seen = False
+        columns: List[str] = []
+        tokens_list = list(parsed.flatten())
         
-        # Remove "where" keyword if present
-        condition = condition.strip()
-        if condition.upper().startswith('WHERE'):
-            condition = condition[5:].strip()
-        
-        # Handle IN (SELECT ...) subqueries
-        # Pattern: col IN (SELECT column FROM table) or pnumber IN (SELECT pnumber FROM operations)
-        pattern = r'(\w+\.)?(\w+)\s+in\s*\(([^)]+)\)'
-        match = re.search(pattern, condition, re.IGNORECASE)
-        if match:
-            col_name = match.group(2)
-            subquery = match.group(3).strip()
+        i = 0
+        while i < len(tokens_list):
+            token = tokens_list[i]
+            token_value_upper = token.value.upper()
             
-            # Find column in dataframe
-            col = None
-            if col_name in df.columns:
-                col = df[col_name]
-            else:
-                for df_col in df.columns:
-                    if df_col.lower() == col_name.lower():
-                        col = df[df_col]
-                        break
+            if token.ttype is Keyword:
+                if token_value_upper == 'GROUP' or token_value_upper.startswith('GROUP'):
+                    group_by_seen = True
+                    if i + 1 < len(tokens_list):
+                        next_token = tokens_list[i + 1]
+                        if next_token.value.upper() == 'BY':
+                            by_seen = True
+                            i += 2
+                            continue
+                    elif 'BY' in token_value_upper:
+                        by_seen = True
+                        i += 1
+                        continue
+                    else:
+                        i += 1
+                        continue
             
-            if col is not None and subquery.upper().startswith('SELECT'):
-                # Parse subquery: SELECT [DISTINCT] column FROM table
-                subquery_lower = subquery.lower()
-                select_idx = subquery_lower.find('select')
-                from_idx = subquery_lower.find(' from ')
-                
-                if from_idx > 0:
-                    # Extract column name
-                    select_part = subquery[select_idx+6:from_idx].strip()
-                    if 'distinct' in select_part.lower():
-                        select_part = re.sub(r'distinct\s+', '', select_part, flags=re.IGNORECASE).strip()
-                    subquery_col = select_part.strip()
-                    
-                    # Extract table name
-                    from_part = subquery[from_idx+6:].strip()
-                    table_parts = from_part.split()
-                    subquery_table = table_parts[0].strip('"\'`') if table_parts else None
-                    
-                    if subquery_table:
-                        # Get values from the subquery table
-                        table_name_lower = subquery_table.lower()
-                        matched_table = None
-                        for available_table in available_tables.keys():
-                            if available_table.lower() == table_name_lower:
-                                matched_table = available_table
-                                break
-                        
-                        if matched_table and matched_table in available_tables:
-                            subquery_df = available_tables[matched_table]
-                            
-                            # Get distinct values from the subquery column
-                            if subquery_col in subquery_df.columns:
-                                subquery_values = subquery_df[subquery_col].dropna().unique()
-                            else:
-                                # Try case-insensitive match
-                                for df_col in subquery_df.columns:
-                                    if df_col.lower() == subquery_col.lower():
-                                        subquery_values = subquery_df[df_col].dropna().unique()
-                                        break
-                                else:
-                                    return df  # Column not found, return original
-                            
-                            # Filter dataframe where column value is IN subquery values
-                            mask = col.isin(subquery_values)
-                            return df[mask]
+            if group_by_seen and by_seen:
+                if token.ttype is Keyword and token_value_upper in [KEYWORD_HAVING, KEYWORD_ORDER]:
+                    break
+                # Accept both bare and named identifiers (sqlparse may tag them as Name)
+                if token.ttype in (None, Name) and token.value.strip() and token_value_upper not in [KEYWORD_HAVING, KEYWORD_ORDER, KEYWORD_BY]:
+                    col = self._clean_identifier(token.value.strip().strip(','))
+                    if col and col.upper() != KEYWORD_BY:
+                        if '.' in col:
+                            col = col.split('.')[-1]
+                        if col not in columns:
+                            columns.append(col)
+            
+            i += 1
         
-        # If no IN subquery found, try regular filtering
-        return self._apply_where_filter(df, condition)
+        if columns:
+            return columns
+        
+        # Fallback: text-based extraction using the full SQL string
+        sql_text = str(parsed)
+        match = _RE_GROUP_BY_FALLBACK.search(sql_text)
+        if not match:
+            return None
+        
+        group_body = match.group(1)
+        fallback_cols: List[str] = []
+        for part in group_body.split(','):
+            col = part.strip().strip('`\" ')
+            if not col:
+                continue
+            # Remove alias and sort direction if present
+            col = col.split()[0]
+            # Remove table/alias prefix if present (e.g., "e.ssn" -> "ssn")
+            if '.' in col:
+                col = col.split('.')[-1]
+            if col.upper() not in ['ASC', 'DESC'] and col not in fallback_cols:
+                fallback_cols.append(col)
+        
+        DebugLogger.log("GROUP BY fallback extraction from text: {}", fallback_cols)
+        return fallback_cols if fallback_cols else None
     
-    def _apply_having_filter(self, df: pd.DataFrame, condition: str) -> pd.DataFrame:
-        """Apply a HAVING filter condition to a grouped DataFrame"""
-        if not condition:
-            return df
+    def _extract_having(self, parsed) -> Optional[Dict[str, Any]]:
+        """Extract HAVING clause."""
+        DebugLogger.log("_extract_having called")
+        having_seen = False
+        condition_parts = []
+        having_columns = []
+        tokens_list = list(parsed.flatten())
         
-        # Remove "having" keyword if present
-        condition = condition.strip()
-        if condition.upper().startswith('HAVING'):
-            condition = condition[6:].strip()
+        DebugLogger.log("Total tokens: {}", len(tokens_list))
         
-        # HAVING can contain aggregate functions like MAX, MIN, SUM, etc.
-        # Handle expressions like "max(frequency) - min(frequency) >= 16"
-        try:
-            # Try to parse aggregate expressions
-            # Pattern: aggregate_func(col) operator aggregate_func(col) comparison value
-            pattern = r'(max|min|sum|avg|count)\((\w+)\)\s*([+\-*/])\s*(max|min|sum|avg|count)?\(?(\w+)?\)?\s*(<|>|<=|>=|=|!=)\s*([\d\w\'"]+)'
-            match = re.search(pattern, condition, re.IGNORECASE)
-            if match:
-                func1 = match.group(1).lower()
-                col1 = match.group(2)
-                operator = match.group(3)
-                func2 = match.group(4)
-                col2 = match.group(5)
-                comparison = match.group(6)
-                value_str = match.group(7).strip('\'"')
-                
-                # For grouped data, compute aggregates per group
-                # Find grouping columns (non-aggregate columns)
-                group_cols = [c for c in df.columns if c.lower() not in [col1.lower(), col2.lower() if col2 else '']]
-                
-                if group_cols and col1 in df.columns:
-                    # Group by the grouping columns and compute aggregates
-                    grouped = df.groupby(group_cols)
-                    
-                    if func1 == 'max':
-                        agg1 = grouped[col1].transform('max')
-                    elif func1 == 'min':
-                        agg1 = grouped[col1].transform('min')
-                    elif func1 == 'sum':
-                        agg1 = grouped[col1].transform('sum')
-                    elif func1 == 'avg':
-                        agg1 = grouped[col1].transform('mean')
-                    else:
-                        agg1 = df[col1]
-                    
-                    if col2 and col2 in df.columns:
-                        if func2 and func2.lower() == 'max':
-                            agg2 = grouped[col2].transform('max')
-                        elif func2 and func2.lower() == 'min':
-                            agg2 = grouped[col2].transform('min')
-                        elif func2 and func2.lower() == 'sum':
-                            agg2 = grouped[col2].transform('sum')
-                        elif func2 and func2.lower() == 'avg':
-                            agg2 = grouped[col2].transform('mean')
-                        else:
-                            agg2 = df[col2]
-                    else:
-                        agg2 = None
-                    
-                    # Perform arithmetic if needed
-                    if operator and agg2 is not None:
-                        if operator == '-':
-                            result = agg1 - agg2
-                        elif operator == '+':
-                            result = agg1 + agg2
-                        elif operator == '*':
-                            result = agg1 * agg2
-                        elif operator == '/':
-                            result = agg1 / agg2
-                        else:
-                            result = agg1
-                    else:
-                        result = agg1
-                    
-                    # Convert value
-                    try:
-                        value = float(value_str) if '.' in value_str else int(value_str)
-                    except:
-                        value = value_str
-                    
-                    # Apply comparison
-                    if comparison == '>=':
-                        mask = result >= value
-                    elif comparison == '<=':
-                        mask = result <= value
-                    elif comparison == '>':
-                        mask = result > value
-                    elif comparison == '<':
-                        mask = result < value
-                    elif comparison == '=':
-                        mask = result == value
-                    else:
-                        mask = pd.Series([True] * len(df))
-                    
-                    return df[mask]
+        for i, token in enumerate(tokens_list):
+            token_value_upper = token.value.upper()
             
-            # Fallback: try simple WHERE-style filtering
-            return self._apply_where_filter(df, condition)
-        except Exception as e:
-            # If HAVING filter fails, return original
-            print(f"Warning: HAVING filter failed: {e}")
-            return df
+            if token.ttype is Keyword and token_value_upper == KEYWORD_HAVING:
+                DebugLogger.log("Found HAVING keyword at token {}: {}", i, token.value)
+                having_seen = True
+                continue
+            
+            if having_seen:
+                # Stop at ORDER BY (may appear as separate tokens or a single combined token)
+                if (token.ttype is Keyword and token_value_upper == KEYWORD_ORDER) or f'{KEYWORD_ORDER} {KEYWORD_BY}' in token_value_upper:
+                    break
+                if token.value == ';':
+                    break
+                
+                if not token.is_whitespace:
+                    condition_parts.append(token.value)
+                
+                if (token.ttype is None or token.ttype is Name) and not token.is_whitespace:
+                    having_columns.extend(self._extract_columns_from_token(token.value))
+        
+        if condition_parts:
+            condition_str = ' '.join(condition_parts).strip()
+            DebugLogger.log("HAVING condition extracted: {}", condition_str)
+            DebugLogger.log("HAVING columns extracted: {}", having_columns)
+            aggregates = self._extract_aggregates_with_aliases(condition_str)
+            DebugLogger.log("HAVING aggregates extracted: {}", aggregates)
+            return {
+                'condition': condition_str,
+                'columns': having_columns,
+                'aggregates': aggregates,
+            }
+        else:
+            DebugLogger.log("HAVING extraction returned None - having_seen={}, condition_parts length={}", 
+                          having_seen, len(condition_parts))
+            if not having_seen:
+                DebugLogger.log("HAVING keyword was never found in tokens")
+        return None
     
-    def _apply_where_filter_with_subquery(self, df: pd.DataFrame, condition: str, available_tables: Dict) -> pd.DataFrame:
-        """Apply WHERE filter with IN (SELECT ...) subquery"""
-        if not condition:
-            return df
+    def _extract_select_columns(self, parsed) -> Optional[List[str]]:
+        """Extract SELECT columns."""
+        select_seen = False
+        columns = []
         
-        # Remove "where" keyword if present
-        condition = condition.strip()
-        if condition.upper().startswith('WHERE'):
-            condition = condition[5:].strip()
+        for token in parsed.flatten():
+            if token.ttype is DML and token.value.upper() == KEYWORD_SELECT:
+                select_seen = True
+                continue
+            if select_seen:
+                if token.ttype is Keyword and token.value.upper() == KEYWORD_FROM:
+                    break
+                if token.ttype is None and token.value.strip() and token.value != '*':
+                    col = self._clean_identifier(token.value.strip().strip(','))
+                    if col and col.upper() != 'FROM':
+                        if ' AS ' in col.upper():
+                            col = col.split(' AS ')[0].strip()
+                        elif ' ' in col and not col.startswith('('):
+                            parts = col.split()
+                            col = parts[0] if len(parts) > 1 else col
+                        columns.append(col)
         
-        # Handle IN (SELECT ...) subqueries
-        # Pattern: col IN (SELECT column FROM table) or pnumber IN (SELECT pnumber FROM operations)
-        pattern = r'(\w+\.)?(\w+)\s+in\s*\(([^)]+)\)'
-        match = re.search(pattern, condition, re.IGNORECASE)
-        if match:
-            col_name = match.group(2)
-            subquery = match.group(3).strip()
-            
-            # Find column in dataframe
-            col = None
-            if col_name in df.columns:
-                col = df[col_name]
-            else:
-                for df_col in df.columns:
-                    if df_col.lower() == col_name.lower():
-                        col = df[df_col]
-                        break
-            
-            if col is not None and subquery.upper().startswith('SELECT'):
-                # Parse subquery: SELECT [DISTINCT] column FROM table
-                subquery_lower = subquery.lower()
-                select_idx = subquery_lower.find('select')
-                from_idx = subquery_lower.find(' from ')
-                
-                if from_idx > 0:
-                    # Extract column name
-                    select_part = subquery[select_idx+6:from_idx].strip()
-                    if 'distinct' in select_part.lower():
-                        select_part = re.sub(r'distinct\s+', '', select_part, flags=re.IGNORECASE).strip()
-                    subquery_col = select_part.strip()
-                    
-                    # Extract table name
-                    from_part = subquery[from_idx+6:].strip()
-                    table_parts = from_part.split()
-                    subquery_table = table_parts[0].strip('"\'`') if table_parts else None
-                    
-                    if subquery_table:
-                        # Get values from the subquery table
-                        table_name_lower = subquery_table.lower()
-                        matched_table = None
-                        for available_table in available_tables.keys():
-                            if available_table.lower() == table_name_lower:
-                                matched_table = available_table
-                                break
-                        
-                        if matched_table and matched_table in available_tables:
-                            subquery_df = available_tables[matched_table]
-                            
-                            # Get distinct values from the subquery column
-                            if subquery_col in subquery_df.columns:
-                                subquery_values = subquery_df[subquery_col].dropna().unique()
-                            else:
-                                # Try case-insensitive match
-                                for df_col in subquery_df.columns:
-                                    if df_col.lower() == subquery_col.lower():
-                                        subquery_values = subquery_df[df_col].dropna().unique()
-                                        break
-                                else:
-                                    return df  # Column not found, return original
-                            
-                            # Filter dataframe where column value is IN subquery values
-                            mask = col.isin(subquery_values)
-                            return df[mask]
+        return columns if columns else None
+    
+    def _extract_order_by(self, parsed) -> Optional[List[str]]:
+        """Extract ORDER BY columns."""
+        order_by_seen = False
+        columns: List[str] = []
         
-        # If no IN subquery found, try regular filtering
-        return self._apply_where_filter(df, condition)
+        for token in parsed.flatten():
+            if token.ttype is Keyword and token.value.upper() == KEYWORD_ORDER:
+                order_by_seen = True
+                continue
+            if order_by_seen:
+                if token.value.upper() == KEYWORD_BY:
+                    continue
+                # Stop at semicolon or other major keywords
+                if token.value == ';' or (token.ttype is Keyword and token.value.upper() in ['LIMIT', 'OFFSET']):
+                    break
+                # Accept both bare and named identifiers (sqlparse may tag them as Name)
+                if token.ttype in (None, Name) and token.value.strip():
+                    col = self._clean_identifier(token.value.strip().strip(','))
+                    if col and col.upper() not in ['ASC', 'DESC']:
+                        # Remove table/alias prefix if present (e.g., "e.ssn" -> "ssn")
+                        if '.' in col:
+                            col = col.split('.')[-1]
+                        if col not in columns:
+                            columns.append(col)
+        
+        if columns:
+            return columns
+        
+        # Fallback: text-based extraction using the full SQL string
+        sql_text = str(parsed)
+        match = _RE_ORDER_BY_FALLBACK.search(sql_text)
+        if not match:
+            return None
+        
+        order_body = match.group(1)
+        fallback_cols: List[str] = []
+        for part in order_body.split(','):
+            col = part.strip().strip('`\" ')
+            if not col:
+                continue
+            # Remove direction / aliases
+            col = col.split()[0]
+            if '.' in col:
+                col = col.split('.')[-1]
+            if col.upper() not in ['ASC', 'DESC'] and col not in fallback_cols:
+                fallback_cols.append(col)
+        
+        DebugLogger.log("ORDER BY fallback extraction from text: {}", fallback_cols)
+        return fallback_cols if fallback_cols else None
+    
+    def _extract_and_add_where(self, parsed):
+        """Extract WHERE clause and add as step."""
+        where_clause = self._extract_where(parsed)
+        if where_clause:
+            self._add_step(STEP_WHERE, {
+                'condition': where_clause['condition'],
+                'columns': where_clause.get('columns', [])
+            })
+    
+    def _extract_and_add_group_by(self, parsed):
+        """Extract GROUP BY and add as step."""
+        group_by = self._extract_group_by(parsed)
+        DebugLogger.log("GROUP BY extraction result: {}", group_by)
+        if group_by:
+            self._add_step(STEP_GROUP_BY, {'columns': group_by})
+            DebugLogger.log("Added GROUP BY step with columns: {}", group_by)
+    
+    def _extract_and_add_having(self, parsed):
+        """Extract HAVING and add as step."""
+        having = self._extract_having(parsed)
+        DebugLogger.log("HAVING extraction result: {}", having)
+        if having:
+            condition = having['condition']
+            columns = having.get('columns', [])
+            aggregates = having.get('aggregates', [])
+            self._add_step(
+                STEP_HAVING,
+                {
+                    'condition': condition,
+                    'columns': columns,
+                    'aggregates': aggregates,
+                },
+            )
+            DebugLogger.log("Added HAVING step with condition: {}", condition)
 
+            # Attach aggregates to the most recent GROUP BY step so it can
+            # compute the necessary aggregate columns for HAVING.
+            if aggregates:
+                for step in reversed(self.steps):
+                    if step.get('step_type') == STEP_GROUP_BY:
+                        step['aggregates'] = aggregates
+                        DebugLogger.log(
+                            "Attached HAVING aggregates to GROUP BY step: {}",
+                            aggregates,
+                        )
+                        break
+    
+    def _extract_and_add_select(self, parsed):
+        """Extract SELECT and add as step."""
+        select_cols = self._extract_select_columns(parsed)
+        if select_cols:
+            self._add_step(STEP_SELECT, {'columns': select_cols})
+    
+    def _extract_and_add_order_by(self, parsed):
+        """Extract ORDER BY and add as step."""
+        order_by = self._extract_order_by(parsed)
+        if order_by:
+            self._add_step(STEP_ORDER_BY, {'columns': order_by})
+    
+    def _clean_identifier(self, value: str) -> str:
+        """Clean an identifier by removing quotes and whitespace."""
+        # More efficient: strip quotes in one pass using lstrip/rstrip with all quote types
+        cleaned = value.strip()
+        # Remove surrounding quotes if present
+        if cleaned:
+            quote_chars = '`"\''
+            while cleaned and cleaned[0] in quote_chars and cleaned[-1] in quote_chars:
+                if cleaned[0] == cleaned[-1]:
+                    cleaned = cleaned[1:-1]
+                else:
+                    break
+        return cleaned
+    
+    def _extract_columns_from_token(self, token_value: str) -> List[str]:
+        """Extract column names from a token value (for HAVING conditions)."""
+        columns = []
+        skip_keywords = SKIP_KEYWORDS_BASE | SKIP_KEYWORDS_AGGREGATION | {'BETWEEN'}
+        
+        # Extract column names with operators
+        col_matches = _RE_COL_WITH_OPERATORS.findall(token_value)
+        for col_name in col_matches:
+            if col_name.upper() not in skip_keywords and col_name not in columns:
+                columns.append(col_name)
+        
+        # Handle aggregation functions with table prefix
+        agg_matches = _RE_AGG_FUNC_WITH_PREFIX.findall(token_value)
+        for _, col in agg_matches:
+            if col not in columns:
+                columns.append(col)
+        
+        # Handle aggregation without table prefix
+        agg_matches2 = _RE_AGG_FUNC_WITHOUT_PREFIX.findall(token_value)
+        for col in agg_matches2:
+            if col.upper() not in SKIP_KEYWORDS_AGGREGATION and col not in columns:
+                columns.append(col)
+        
+        return columns
+    
+    def _extract_columns_from_join_condition(self, condition: str) -> List[str]:
+        """Extract column names from a JOIN ON condition."""
+        columns = []
+        skip_keywords = SKIP_KEYWORDS_BASE | {'ON'}
+        
+        # Extract from patterns like "e.ssn" or "w.essn" (table.column)
+        table_col_matches = _RE_TABLE_COL.findall(condition)
+        for col in table_col_matches:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        
+        # Extract standalone column names in comparisons (e.g., "column = value")
+        standalone_cols = _RE_STANDALONE_COL.findall(condition)
+        for col in standalone_cols:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        
+        return columns
+    
+    def _extract_columns_from_condition(self, condition: str, is_having: bool = False) -> List[str]:
+        """Extract column names from a WHERE or HAVING condition."""
+        if not condition:
+            return []
+        
+        skip_keywords = SKIP_KEYWORDS_BASE | (SKIP_KEYWORDS_AGGREGATION if is_having else set())
+        
+        # Normalize condition: collapse multiple spaces and handle spaced-out tokens
+        # e.g., "sum ( w . hours )" -> "sum(w.hours)"
+        normalized_condition = self._normalize_condition_string(condition)
+        DebugLogger.log("Normalized condition for extraction: {}", normalized_condition)
+        
+        # Extract columns with various patterns
+        columns = []
+        columns.extend(self._extract_columns_with_operators(normalized_condition, skip_keywords))
+        columns.extend(self._extract_table_column_patterns(normalized_condition, skip_keywords))
+        columns.extend(self._extract_like_patterns(normalized_condition))
+        columns.extend(self._extract_in_clauses(normalized_condition, skip_keywords))
+        columns.extend(self._extract_between_clauses(normalized_condition, skip_keywords))
+        
+        if is_having:
+            columns.extend(self._extract_aggregation_columns(normalized_condition))
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_columns = []
+        for col in columns:
+            if col not in seen:
+                seen.add(col)
+                unique_columns.append(col)
+        
+        return unique_columns
+    
+    def _normalize_condition_string(self, condition: str) -> str:
+        """Normalize condition string by removing extraneous spaces."""
+        if not condition:
+            return condition
+        normalized = _RE_NORMALIZE_SPACES.sub(' ', condition.strip())
+        # Handle spaced-out function calls: "sum ( w . hours )" -> "sum(w.hours)"
+        normalized = _RE_NORMALIZE_FUNC_WITH_TABLE.sub(r'\1(\2.\3)', normalized)
+        normalized = _RE_NORMALIZE_FUNC_WITHOUT_TABLE.sub(r'\1(\2)', normalized)
+        # Handle spaced-out table.column: "e . ssn" -> "e.ssn"
+        normalized = _RE_NORMALIZE_TABLE_COL.sub(r'\1.\2', normalized)
+        return normalized
+    
+    def _extract_columns_with_operators(self, condition: str, skip_keywords: set) -> List[str]:
+        """Extract columns with operators (e.g., "column = value")."""
+        columns = []
+        col_matches = _RE_COL_WITH_OPERATORS.findall(condition)
+        for col in col_matches:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        return columns
+    
+    def _extract_table_column_patterns(self, condition: str, skip_keywords: set) -> List[str]:
+        """Extract table.column patterns."""
+        columns = []
+        table_col_matches = _RE_TABLE_COL.findall(condition)
+        for col in table_col_matches:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        return columns
+    
+    def _extract_like_patterns(self, condition: str) -> List[str]:
+        """Extract columns from LIKE patterns."""
+        columns = []
+        like_matches = _RE_LIKE_PATTERN.findall(condition)
+        for _, col in like_matches:
+            if col not in columns:
+                columns.append(col)
+        return columns
+    
+    def _extract_in_clauses(self, condition: str, skip_keywords: set) -> List[str]:
+        """Extract columns from IN clauses."""
+        columns = []
+        in_matches = _RE_IN_CLAUSE.findall(condition)
+        for col in in_matches:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        return columns
+    
+    def _extract_between_clauses(self, condition: str, skip_keywords: set) -> List[str]:
+        """Extract columns from BETWEEN clauses."""
+        columns = []
+        between_matches = _RE_BETWEEN_CLAUSE.findall(condition)
+        for col in between_matches:
+            if col.upper() not in skip_keywords and col not in columns:
+                columns.append(col)
+        return columns
+    
+    def _extract_aggregation_columns(self, condition: str) -> List[str]:
+        """Extract columns from aggregation functions."""
+        columns = []
+        # Pattern: SUM(column) or SUM(table.column)
+        agg_matches = _RE_AGG_COL_WITH_PREFIX.findall(condition)
+        for col in agg_matches:
+            if col.upper() not in SKIP_KEYWORDS_AGGREGATION and col not in columns:
+                columns.append(col)
+        # Also handle table.column in aggregations: SUM(table.column)
+        agg_table_col_matches = _RE_AGG_COL_TABLE_PREFIX.findall(condition)
+        for col in agg_table_col_matches:
+            if col.upper() not in SKIP_KEYWORDS_AGGREGATION and col not in columns:
+                columns.append(col)
+        return columns
+
+    def _extract_aggregates_with_aliases(self, condition: str) -> List[Dict[str, str]]:
+        """Extract aggregate functions and assign stable aliases for GROUP BY/HAVING."""
+        aggregates: List[Dict[str, str]] = []
+        if not condition:
+            return aggregates
+        # Normalize first so spaced-out expressions like "sum ( w . hours )"
+        # become "sum(w.hours)" and can be matched reliably.
+        normalized = self._normalize_condition_string(condition)
+        
+        # Also normalize DISTINCT: "count ( distinct remote_access )" -> "count(distinct remote_access)"
+        normalized = re.sub(r'\bdistinct\s+', 'distinct ', normalized, flags=re.IGNORECASE)
+
+        matches = _RE_AGG_WITH_ALIAS.findall(normalized)
+        used_aliases = set()
+        for func, col in matches:
+            base_col = col
+            base_alias = f"{func.lower()}_{base_col}"
+            alias = base_alias
+            idx = 2
+            while alias in used_aliases:
+                alias = f"{base_alias}_{idx}"
+                idx += 1
+            used_aliases.add(alias)
+            
+            # Check if DISTINCT was present for this specific aggregate
+            # Look for pattern: func(distinct col) or func(DISTINCT col)
+            # Use a more efficient check: look for the pattern around the matched position
+            # Find the position of this aggregate in the normalized string
+            agg_pattern = rf'{re.escape(func)}\s*\(\s*(?:distinct\s+)?{re.escape(base_col)}\s*\)'
+            match_obj = re.search(agg_pattern, normalized, re.IGNORECASE)
+            if match_obj:
+                # Check if 'distinct' appears between func and base_col
+                func_end = match_obj.start() + len(func)
+                col_start = match_obj.end() - len(base_col) - 1  # -1 for closing paren
+                between_text = normalized[func_end:col_start].lower()
+                has_distinct = 'distinct' in between_text
+            else:
+                has_distinct = False
+            
+            aggregates.append(
+                {
+                    'func': func.upper(),
+                    'column': base_col,
+                    'alias': alias,
+                    'distinct': has_distinct,
+                }
+            )
+
+        DebugLogger.log("Extracted aggregates from condition '{}': {}", condition, aggregates)
+        return aggregates
+
+
+# ============================================================================
+# Query Visualizer
+# ============================================================================
+
+class QueryVisualizer:
+    """Extremely simplified query executor.
+
+    - Uses tables already loaded into `graph_builder` (from SQL / CSV uploads)
+    - Registers those tables as DuckDB views
+    - Executes the full SQL query and returns the output table
+    """
+
+    def __init__(self, graph_builder):
+        """Store the `graph_builder` that holds in-memory tables."""
+        self.graph_builder = graph_builder
+    
+    @contextmanager
+    def _db_connection(self, tables: Optional[Dict[str, pd.DataFrame]] = None):
+        """Context manager for DuckDB connections with automatic cleanup."""
+        if not HAS_DUCKDB:
+            raise RuntimeError("DuckDB is not installed.")
+        
+        con = duckdb.connect(database=":memory:")
+        try:
+            if tables:
+                for name, df in tables.items():
+                    con.register(name, df)
+            yield con
+        finally:
+            con.close()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    
+    def _clean_for_json(self, obj: Any):
+        """Recursively clean NaN/inf values and convert numpy types to Python types for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: self._clean_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._clean_for_json(item) for item in obj]
+        if isinstance(obj, pd.DataFrame):
+            # More efficient: convert to dict records directly
+            return self._clean_for_json(obj.to_dict("records"))
+        if isinstance(obj, pd.Series):
+            return [self._clean_for_json(item) for item in obj]
+        
+        # Handle numpy types more efficiently
+        obj_type = type(obj)
+        obj_module = getattr(obj_type, '__module__', None)
+        
+        # Handle numpy integer types
+        if isinstance(obj, np.integer):
+            return int(obj)
+        
+        # Handle numpy float types
+        if isinstance(obj, np.floating):
+            try:
+                if pd.isna(obj) or math.isnan(obj) or math.isinf(obj):
+                    return None
+                return float(obj)
+            except (TypeError, ValueError, AttributeError):
+                return None
+        
+        # Handle regular float
+        if isinstance(obj, float):
+            try:
+                if pd.isna(obj) or math.isnan(obj) or math.isinf(obj):
+                    return None
+                return obj
+            except (TypeError, ValueError):
+                return None
+        
+        # Handle numpy bool and string types
+        if obj_module == 'numpy':
+            type_name = obj_type.__name__
+            if type_name in ('bool_', 'bool8'):
+                return bool(obj)
+            if type_name in ('str_', 'string_', 'unicode_'):
+                return str(obj)
+        
+        return obj
+
+    def _get_tables_as_dataframes(self) -> Dict[str, pd.DataFrame]:
+        """Convert all tables known to `graph_builder` into DataFrames."""
+        tables: Dict[str, pd.DataFrame] = {}
+        table_rows = getattr(self.graph_builder, "table_rows", {}) or {}
+        
+        for table_name in table_rows.keys():
+            rows = self.graph_builder.get_table_rows(table_name)
+            if not rows:
+                continue
+            try:
+                tables[table_name] = pd.DataFrame(rows)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"Warning: could not create DataFrame for table {table_name}: {exc}")
+        return tables
+
+    def _dataframe_to_table_dict(self, df: pd.DataFrame, name: str) -> Dict[str, Any]:
+        """Convert DataFrame to table dictionary for JSON serialization."""
+        if df is None or df.empty:
+            return {
+                'name': name,
+                'columns': [],
+                'data': [],
+                'row_count': 0
+            }
+        
+        rows = self._clean_for_json(df)
+        return {
+            'name': name,
+            'columns': list(df.columns),
+            'data': rows,
+            'row_count': len(df)
+        }
+
+    def _strip_table_aliases(self, expression: str) -> str:
+        """Remove table/alias prefixes from column references (e.g., e.ssn -> ssn).
+
+        This is used for intermediate steps (WHERE / HAVING) that operate on a
+        single in-memory table where columns no longer carry SQL aliases.
+        """
+        if not expression:
+            return expression
+        # Normalize spaced-out table.column first, then strip the prefix.
+        normalized = _RE_NORMALIZE_TABLE_COL.sub(r'\1.\2', expression)
+        return _RE_STRIP_TABLE_ALIAS.sub(r'\1', normalized)
+    
+    def _create_error_step(self, step_type: str, step_number: int, error_msg: str) -> Dict[str, Any]:
+        """Create an error step result."""
+        return {
+            'step_number': step_number,
+            'step_type': step_type,
+            'input_tables': [],
+            'output_table': None,
+            'highlighted_cols': [],
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_number}: {step_type} ({error_msg})"
+        }
+    
+    def _update_step_state(self, step_result: Dict, current_df: Optional[pd.DataFrame], 
+                          current_table_name: Optional[str]) -> tuple:
+        """Update current state from step result. Returns (current_df, current_table_name)."""
+        if step_result.get('_dataframe') is not None:
+            return step_result['_dataframe'], step_result.get('_table_name', 'intermediate_result')
+        elif step_result.get('output_table'):
+            output_data = step_result['output_table']
+            if output_data and output_data.get('data'):
+                try:
+                    return pd.DataFrame(output_data['data']), output_data.get('name', 'intermediate_result')
+                except Exception as e:
+                    DebugLogger.log("Warning: Could not convert output to DataFrame: {}", e)
+        elif step_result.get('step_type') == 'FROM' and step_result.get('input_tables'):
+            first_table = step_result['input_tables'][0]
+            if first_table and first_table.get('data'):
+                try:
+                    df = pd.DataFrame(first_table['data'])
+                    step_result['_dataframe'] = df
+                    step_result['_table_name'] = first_table.get('name', 'base_table')
+                    return df, first_table.get('name', 'base_table')
+                except Exception as e:
+                    DebugLogger.log("Warning: Could not convert FROM table to DataFrame: {}", e)
+        
+        return current_df, current_table_name
+    
+    def _normalize_column_names(self, extracted_cols: List[str], actual_cols: List[str]) -> List[str]:
+        """Normalize extracted column names to match actual DataFrame column names.
+        
+        Handles cases where:
+        - Extracted columns might be just column names (e.g., "ssn")
+        - Actual columns might have table prefixes (e.g., "left_table.ssn", "works_on.essn")
+        - Matches by exact name or by suffix after dot
+        """
+        if not extracted_cols or not actual_cols:
+            return []
+        
+        # Build lookup dictionaries for O(1) access instead of O(n) searches
+        actual_cols_lower_map = {c.lower(): c for c in actual_cols}
+        suffix_map = {}  # Maps suffix -> list of columns with that suffix
+        normalized = []
+        seen = set()  # Track normalized columns to avoid duplicates
+        
+        # Build suffix map
+        for actual_col in actual_cols:
+            if '.' in actual_col:
+                suffix = actual_col.split('.')[-1].lower()
+                if suffix not in suffix_map:
+                    suffix_map[suffix] = []
+                suffix_map[suffix].append(actual_col)
+        
+        for col in extracted_cols:
+            col_lower = col.lower()
+            
+            # Try exact match first (O(1))
+            if col_lower in actual_cols_lower_map:
+                matched_col = actual_cols_lower_map[col_lower]
+                if matched_col not in seen:
+                    normalized.append(matched_col)
+                    seen.add(matched_col)
+            # Try matching by suffix (O(1) lookup)
+            elif col_lower in suffix_map:
+                for actual_col in suffix_map[col_lower]:
+                    if actual_col not in seen:
+                        normalized.append(actual_col)
+                        seen.add(actual_col)
+        
+        DebugLogger.log("Normalized columns: {} -> {}", extracted_cols, normalized)
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    
+    def execute_query(self, query_text: str) -> Dict[str, Any]:
+        """Execute the SQL query and return only the resulting table.
+
+        Handles multi-line queries and input that may contain multiple
+        statements by executing only the **last non-empty statement**.
+
+        Returns a JSON-ready dict:
+        {
+            "columns": [col1, col2, ...],
+            "rows": [ {col1: v1, col2: v2, ...}, ... ],
+            "row_count": int,
+        }
+        """
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("Query text must be a non-empty string")
+
+        # Normalize and extract the last non-empty statement
+        cleaned = query_text.strip()
+        statements = [stmt.strip() for stmt in cleaned.split(";") if stmt.strip()]
+        if not statements:
+            raise ValueError("Query text must contain at least one SQL statement")
+        sql_to_run = statements[-1]
+
+        tables = self._get_tables_as_dataframes()
+        if not tables:
+            raise ValueError("No tables available. Please upload data first.")
+
+        # Fresh in-memory connection per call
+        try:
+            with self._db_connection(tables) as con:
+                result_df: pd.DataFrame = con.execute(sql_to_run).fetchdf()
+        except RuntimeError as exc:
+            raise exc
+        except Exception as exc:
+            raise ValueError(f"Error executing SQL query: {exc}") from exc
+
+        cleaned_rows = self._clean_for_json(result_df)
+        return {
+            "columns": list(result_df.columns),
+            "rows": cleaned_rows,
+            "row_count": len(result_df),
+        }
+
+    def execute_query_steps(self, query_text: str) -> Dict[str, Any]:
+        """Execute query step-by-step and return intermediate results for visualization.
+        
+        Returns:
+            {
+                "steps": [step1, step2, ...],
+                "final_result": {columns, rows, row_count}
+            }
+        """
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("Query text must be a non-empty string")
+        
+        # Normalize query text
+        normalized_query = query_text.strip()
+        if normalized_query.endswith(';'):
+            normalized_query = normalized_query[:-1].strip()
+        
+        try:
+            # Parse query to get steps
+            DebugLogger.log("About to parse query in execute_query_steps: {}...", normalized_query[:100])
+            parser = SQLQueryParser()
+            step_definitions = parser.parse(normalized_query)
+            
+            DebugLogger.log("Parsed {} steps in execute_query_steps", len(step_definitions))
+            for step in step_definitions:
+                DebugLogger.log("Step {}: {}", step.get('step_number'), step.get('step_type'))
+                if step.get('step_type') == 'JOIN':
+                    DebugLogger.log("  - Right table: {}, Condition: {}", 
+                                  step.get('right_table'), step.get('join_condition'))
+                elif step.get('step_type') == 'HAVING':
+                    DebugLogger.log("  - HAVING condition: {}", step.get('condition'))
+        except Exception as e:
+            # If parsing fails, fall back to just returning final result
+            print(f"Error parsing query steps: {e}")
+            print(traceback.format_exc())
+            final_result = self.execute_query(query_text)
+            DebugLogger.log(
+                "execute_query_steps fallback (parse error) final_result: columns={}, row_count={}",
+                final_result.get("columns", []),
+                final_result.get("row_count", "N/A"),
+            )
+            cleaned_final_result = self._clean_for_json(final_result)
+            return {"steps": [], "final_result": cleaned_final_result}
+        
+        if not step_definitions:
+            final_result = self.execute_query(query_text)
+            DebugLogger.log(
+                "execute_query_steps: no step_definitions, final_result: columns={}, row_count={}",
+                final_result.get("columns", []),
+                final_result.get("row_count", "N/A"),
+            )
+            cleaned_final_result = self._clean_for_json(final_result)
+            return {"steps": [], "final_result": cleaned_final_result}
+        
+        # Get tables
+        tables = self._get_tables_as_dataframes()
+        if not tables:
+            raise ValueError("No tables available. Please upload data first.")
+        
+        # Execute steps incrementally
+        steps = []
+        current_df = None
+        current_table_name = None
+        
+        # Check if this is a UNION query
+        has_union = any(step.get('union_side') for step in step_definitions) or any(
+            step.get('step_type') == STEP_UNION for step in step_definitions
+        )
+        
+        if has_union:
+            # Handle UNION query: execute left side, then right side, then UNION
+            left_steps = [s for s in step_definitions if s.get('union_side') == 'left']
+            right_steps = [s for s in step_definitions if s.get('union_side') == 'right']
+            union_step = next((s for s in step_definitions if s.get('step_type') == STEP_UNION), None)
+            
+            left_df = None
+            left_table_name = None
+            right_df = None
+            right_table_name = None
+            
+            try:
+                # Execute left side steps
+                for step_def in left_steps:
+                    step_type = step_def['step_type']
+                    DebugLogger.log("Executing step {} (left): {}", step_def.get('step_number'), step_type)
+                    
+                    step_result = self._execute_step(
+                        step_def, left_df, left_table_name, tables, query_text
+                    )
+                    steps.append(step_result)
+                    
+                    # Update state for next left step
+                    left_df, left_table_name = self._update_step_state(
+                        step_result, left_df, left_table_name
+                    )
+                
+                # Execute right side steps (start fresh)
+                for step_def in right_steps:
+                    step_type = step_def['step_type']
+                    DebugLogger.log("Executing step {} (right): {}", step_def.get('step_number'), step_type)
+                    
+                    step_result = self._execute_step(
+                        step_def, right_df, right_table_name, tables, query_text
+                    )
+                    steps.append(step_result)
+                    
+                    # Update state for next right step
+                    right_df, right_table_name = self._update_step_state(
+                        step_result, right_df, right_table_name
+                    )
+                
+                # Execute UNION step with both results
+                if union_step:
+                    # Pass both left and right results to UNION step
+                    union_step['_left_df'] = left_df
+                    union_step['_left_table_name'] = left_table_name
+                    union_step['_right_df'] = right_df
+                    union_step['_right_table_name'] = right_table_name
+                    
+                    step_result = self._execute_step(
+                        union_step, None, None, tables, query_text
+                    )
+                    steps.append(step_result)
+                    
+                    # Update state for final result
+                    current_df, current_table_name = self._update_step_state(
+                        step_result, None, None
+                    )
+            except Exception as e:
+                print(f"Error executing UNION steps: {e}")
+                print(traceback.format_exc())
+        else:
+            # Normal query execution (non-UNION)
+            try:
+                for step_def in step_definitions:
+                    step_type = step_def['step_type']
+                    DebugLogger.log("Executing step {}: {}", step_def.get('step_number'), step_type)
+                    
+                    step_result = self._execute_step(
+                        step_def, current_df, current_table_name, tables, query_text
+                    )
+                    steps.append(step_result)
+                    
+                    # Update state for next step
+                    current_df, current_table_name = self._update_step_state(
+                        step_result, current_df, current_table_name
+                    )
+            except Exception as e:
+                print(f"Error executing steps: {e}")
+                print(traceback.format_exc())
+        
+        # Get final result
+        try:
+            final_result = self.execute_query(query_text)
+            final_step = {
+                'step_number': len(steps) + 1,
+                'step_type': STEP_FINAL_RESULT,
+                'input_tables': [],
+                'output_table': {
+                    'name': 'Final Result',
+                    'columns': final_result.get('columns', []),
+                    'data': final_result.get('rows', []),
+                    'row_count': final_result.get('row_count', 0)
+                },
+                'highlighted_cols': [],
+                'highlighted_rows': [],
+                'dimmed_rows': [],
+                'explanation': f"Final Result: {final_result.get('row_count', 0)} rows"
+            }
+            steps.append(final_step)
+        except Exception as e:
+            raise ValueError(f"Error executing query: {e}")
+        
+        # Clean all step results for JSON serialization
+        cleaned_steps = []
+        for step in steps:
+            cleaned_step = {k: v for k, v in step.items() if not k.startswith('_')}
+            cleaned_steps.append(self._clean_for_json(cleaned_step))
+        
+        # Clean final_result for JSON serialization
+        cleaned_final_result = self._clean_for_json(final_result)
+        
+        return {"steps": cleaned_steps, "final_result": cleaned_final_result}
+    
+    def _execute_step(
+        self, 
+        step_def: Dict[str, Any], 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        tables: Dict[str, pd.DataFrame],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute a single step and return visualization data."""
+        step_type = step_def['step_type']
+        step_number = step_def.get('step_number', 0)
+        
+        step_executors = {
+            STEP_FROM: self._execute_from_step,
+            STEP_JOIN: self._execute_join_step,
+            STEP_WHERE: self._execute_where_step,
+            STEP_GROUP_BY: self._execute_group_by_step,
+            STEP_HAVING: self._execute_having_step,
+            STEP_SELECT: self._execute_select_step,
+            STEP_ORDER_BY: self._execute_order_by_step,
+            STEP_UNION_INPUT: self._execute_union_input_step,
+            STEP_UNION: self._execute_union_step,
+        }
+        
+        executor = step_executors.get(step_type)
+        if executor:
+            if step_type == STEP_FROM:
+                return executor(step_def, tables)
+            elif step_type == STEP_JOIN:
+                return executor(step_def, current_df, current_table_name, tables)
+            else:
+                return executor(step_def, current_df, current_table_name, full_query)
+        
+        return self._create_error_step(step_type, step_number, 'unknown step type')
+    
+    def _execute_from_step(self, step_def: Dict, tables: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        """Execute FROM step."""
+        table_names = step_def.get('tables', [])
+        input_tables = []
+        first_df = None
+        first_table_name = None
+        
+        for table_name in table_names:
+            if table_name in tables:
+                df = tables[table_name]
+                input_tables.append(self._dataframe_to_table_dict(df, table_name))
+                if first_df is None:
+                    first_df = df
+                    first_table_name = table_name
+        
+        output_table = input_tables[0] if input_tables else None
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 1),
+            'step_type': STEP_FROM,
+            'input_tables': input_tables,
+            'output_table': output_table,
+            'highlighted_cols': [],
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 1)}: Loading table(s) {', '.join(table_names)}"
+        }
+        
+        if first_df is not None:
+            step_result['_dataframe'] = first_df
+            step_result['_table_name'] = first_table_name
+        
+        return step_result
+    
+    def _execute_join_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        tables: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Any]:
+        """Execute JOIN step."""
+        right_table_name = step_def.get('right_table')
+        join_type = step_def.get('join_type', 'INNER')
+        join_columns = step_def.get('join_columns', [])
+        from_tables = step_def.get('from_tables', [])
+        left_table_name = step_def.get('left_table')
+        
+        # Load left table if needed
+        if current_df is None:
+            if left_table_name and left_table_name in tables:
+                current_df = tables[left_table_name]
+                current_table_name = left_table_name
+            elif from_tables and from_tables[0] in tables:
+                current_df = tables[from_tables[0]]
+                current_table_name = from_tables[0]
+            else:
+                return self._create_error_step(STEP_JOIN, step_def.get('step_number', 0), 'missing left table')
+        
+        if right_table_name not in tables:
+            return self._create_error_step(STEP_JOIN, step_def.get('step_number', 0), 
+                                         f'missing right table: {right_table_name}')
+        
+        right_df = tables[right_table_name]
+        left_table_dict = self._dataframe_to_table_dict(current_df, current_table_name or 'left_table')
+        right_table_dict = self._dataframe_to_table_dict(right_df, right_table_name)
+        
+        # Execute join using DuckDB
+        left_table_alias = step_def.get('left_table_alias')
+        right_table_alias = step_def.get('right_table_alias')
+        result_df, output_table = self._execute_join_query(
+            current_df, right_df, join_type, step_def.get('join_condition', ''),
+            current_table_name or TABLE_LEFT, right_table_name,
+            left_table_alias, right_table_alias, current_df
+        )
+        
+        # Normalize join columns to match actual table columns
+        # For JOIN, we want to highlight columns in the input tables
+        # Combine columns from both input tables for highlighting
+        left_cols = current_df.columns.tolist()
+        right_cols = right_df.columns.tolist()
+        all_input_cols = list(set(left_cols + right_cols))  # Remove duplicates
+        
+        normalized_join_cols = self._normalize_column_names(join_columns, all_input_cols)
+        DebugLogger.log("JOIN columns normalized: {} -> {}", join_columns, normalized_join_cols)
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_JOIN,
+            'input_tables': [left_table_dict, right_table_dict],
+            'output_table': output_table,
+            'highlighted_cols': normalized_join_cols,
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 0)}: {join_type} JOIN {right_table_name}",
+            'join_info': {
+                'left_table': current_table_name or TABLE_LEFT,
+                'right_table': right_table_name,
+                'join_columns': normalized_join_cols,
+                'join_type': join_type
+            }
+        }
+        
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_JOINED_RESULT
+        else:
+            DebugLogger.log("JOIN step FAILED - result_df is None, cannot store _dataframe")
+        
+        return step_result
+    
+    def _execute_join_query(
+        self,
+        left_df: pd.DataFrame,
+        right_df: pd.DataFrame,
+        join_type: str,
+        join_condition: str,
+        left_table_name: str,
+        right_table_name: str,
+        left_table_alias: Optional[str] = None,
+        right_table_alias: Optional[str] = None,
+        left_df_for_alias_resolution: Optional[pd.DataFrame] = None
+    ) -> tuple:
+        """Execute a JOIN query using DuckDB. Returns (result_df, output_table_dict)."""
+        tables = {TABLE_LEFT: left_df, right_table_name: right_df}
+        
+        # Build join query
+        join_keyword = self._normalize_join_keyword(join_type)
+        # Use left_df_for_alias_resolution if provided (for resolving aliases from previous JOINs)
+        alias_resolution_df = left_df_for_alias_resolution if left_df_for_alias_resolution is not None else left_df
+        fixed_condition = self._fix_join_condition_aliases(
+            join_condition, left_table_name, right_table_name,
+            left_table_alias, right_table_alias, alias_resolution_df
+        )
+        
+        join_sql = f"SELECT * FROM {TABLE_LEFT} {join_keyword} JOIN {right_table_name}"
+        if fixed_condition:
+            join_sql += f" ON {fixed_condition}"
+        
+        result_df = None
+        try:
+            with self._db_connection(tables) as con:
+                result_df = con.execute(join_sql).fetchdf()
+                output_table = self._dataframe_to_table_dict(result_df, TABLE_JOINED_RESULT)
+                DebugLogger.log("JOIN executed successfully, result shape: {}, columns: {}", result_df.shape, list(result_df.columns))
+        except Exception as e:
+            DebugLogger.log("JOIN failed with error: {}, join_sql: {}", e, join_sql)
+            # Fallback: try without explicit join type
+            try:
+                join_sql = f"SELECT * FROM {TABLE_LEFT} JOIN {right_table_name}"
+                if fixed_condition:
+                    join_sql += f" ON {fixed_condition}"
+                with self._db_connection(tables) as con:
+                    result_df = con.execute(join_sql).fetchdf()
+                    output_table = self._dataframe_to_table_dict(result_df, TABLE_JOINED_RESULT)
+                    DebugLogger.log("JOIN fallback succeeded, result shape: {}", result_df.shape)
+            except Exception as e2:
+                DebugLogger.log("JOIN fallback also failed: {}", e2)
+                output_table = None
+                result_df = None
+        
+        return result_df, output_table
+    
+    def _normalize_join_keyword(self, join_type: str) -> str:
+        """Normalize join type to DuckDB-compatible keyword."""
+        join_keyword = join_type.upper()
+        if 'OUTER' in join_keyword:
+            if 'LEFT' in join_keyword:
+                return 'LEFT OUTER'
+            elif 'RIGHT' in join_keyword:
+                return 'RIGHT OUTER'
+            elif 'FULL' in join_keyword:
+                return 'FULL OUTER'
+        return join_keyword
+    
+    def _fix_join_condition_aliases(
+        self, 
+        condition: str, 
+        left_table: str, 
+        right_table: str,
+        left_alias: Optional[str] = None,
+        right_alias: Optional[str] = None,
+        left_df: Optional[pd.DataFrame] = None
+    ) -> str:
+        """Replace aliases in join condition with actual table names.
+        
+        For multi-join queries, aliases from previous JOINs (like 'p' from the first JOIN)
+        need to be resolved to actual column names in the left_df, not table aliases.
+        """
+        if not condition:
+            return condition
+        
+        condition_fixed = condition
+        
+        # First, handle right table alias (this is straightforward - always use right_table name)
+        if right_alias:
+            # Replace right alias (e.g., "m." -> "maintenance_types.")
+            condition_fixed = re.sub(rf'\b{re.escape(right_alias)}\.', f'{right_table}.', condition_fixed)
+        
+        # For left table, we need to be smarter:
+        # 1. If left_alias is provided and matches, use it
+        # 2. Otherwise, check if the alias refers to a column in left_df (from previous JOINs)
+        # 3. If found, remove the alias prefix (columns after JOIN typically don't have table prefixes)
+        
+        if left_alias:
+            # Replace left alias (e.g., "a." -> "left_table.")
+            condition_fixed = re.sub(rf'\b{re.escape(left_alias)}\.', f'{TABLE_LEFT}.', condition_fixed)
+        
+        # Handle aliases from previous JOINs that are now part of the left_df
+        # Extract all table.column patterns and check if they need to be resolved
+        if left_df is not None:
+            left_cols_list = list(left_df.columns)
+            left_cols = set(left_cols_list)
+            # Build case-insensitive lookup map once for efficiency
+            left_cols_lower_map = {c.lower(): c for c in left_cols_list}
+            # Build suffix lookup map (columns ending with _<number>)
+            suffix_map = {}
+            for c in left_cols_list:
+                if '_' in c and c.split('_')[-1].isdigit():
+                    base = '_'.join(c.split('_')[:-1])
+                    if base not in suffix_map:
+                        suffix_map[base] = []
+                    suffix_map[base].append(c)
+            
+            DebugLogger.log("_fix_join_condition_aliases: left_df columns: {}", left_cols_list)
+            DebugLogger.log("_fix_join_condition_aliases: condition_fixed before alias resolution: {}", condition_fixed)
+            
+            # Find all alias.column patterns in the condition that haven't been replaced yet
+            # Use module-level compiled regex for better performance
+            matches = list(_RE_ALIAS_COL_PATTERN.finditer(condition_fixed))
+            DebugLogger.log("_fix_join_condition_aliases: found {} alias.column patterns", len(matches))
+            
+            if matches:
+                # Use list-based replacement for better performance with multiple replacements
+                # Build replacement list in reverse order
+                replacements = []
+                for match in reversed(matches):
+                    alias = match.group(1)
+                    col = match.group(2)
+                    
+                    # Skip if this is the right_alias, left_alias, or a table name (already handled above)
+                    if alias == right_alias or alias == left_alias or alias in [TABLE_LEFT, left_table, right_table]:
+                        continue
+                    
+                    # This must be an alias from a previous JOIN
+                    # Try to find matching column in left_df using optimized lookups
+                    matching_col = None
+                    
+                    # Strategy 1: Look for columns ending with _<number> (DuckDB renames duplicates from JOINs)
+                    if col in suffix_map:
+                        matching_col = suffix_map[col][0]  # Use first match
+                    # Strategy 2: Exact match (no suffix)
+                    elif col in left_cols:
+                        matching_col = col
+                    # Strategy 3: Case-insensitive match
+                    elif col.lower() in left_cols_lower_map:
+                        matching_col = left_cols_lower_map[col.lower()]
+                    
+                    if matching_col:
+                        replacements.append((match.start(), match.end(), matching_col))
+                        DebugLogger.log("Resolved alias {}.{} to column {} (from previous JOIN)", alias, col, matching_col)
+                    else:
+                        # Strategy 4: Try with TABLE_LEFT prefix as last resort
+                        replacement = f'{TABLE_LEFT}.{col}'
+                        replacements.append((match.start(), match.end(), replacement))
+                        DebugLogger.log("Resolved alias {}.{} to {} (fallback with table prefix)", alias, col, replacement)
+                
+                # Apply all replacements in reverse order (to preserve indices)
+                if replacements:
+                    # Convert to list of characters for efficient replacement
+                    condition_chars = list(condition_fixed)
+                    for start, end, replacement in replacements:
+                        condition_chars[start:end] = replacement
+                    condition_fixed = ''.join(condition_chars)
+        
+        # Fallback: Replace common single-letter aliases if not explicitly provided
+        # This is a heuristic for cases where aliases weren't extracted
+        if not left_alias and left_df is None:
+            condition_fixed = re.sub(r'\ba\.', f'{TABLE_LEFT}.', condition_fixed)
+        if not right_alias:
+            condition_fixed = re.sub(r'\bm\.', f'{right_table}.', condition_fixed)
+        
+        DebugLogger.log("Original condition: {}, Fixed: {}", condition, condition_fixed)
+        return condition_fixed
+    
+    def _execute_where_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute WHERE step."""
+        if current_df is None:
+            return self._create_error_step(STEP_WHERE, step_def.get('step_number', 0), 'no input')
+        
+        input_table = self._dataframe_to_table_dict(current_df, current_table_name or 'input')
+        condition = step_def.get('condition', '')
+        DebugLogger.log("WHERE step - condition: {}", condition)
+        
+        result_df, output_table, dimmed_indices = self._execute_filter_query(
+            current_df, condition, TABLE_FILTERED_RESULT
+        )
+        
+        where_columns = step_def.get('columns', [])
+        DebugLogger.log("WHERE step - columns from step_def: {}", where_columns)
+        if not where_columns and condition:
+            # Use SQLQueryParser's method for consistency
+            parser = SQLQueryParser()
+            where_columns = parser._extract_columns_from_condition(condition, is_having=False)
+            DebugLogger.log("WHERE step - extracted columns from condition: {}", where_columns)
+        
+        # Normalize column names to match actual DataFrame columns
+        if current_df is not None and where_columns:
+            actual_cols = current_df.columns.tolist()
+            DebugLogger.log("WHERE step - actual DataFrame columns: {}", actual_cols)
+            where_columns = self._normalize_column_names(where_columns, actual_cols)
+            DebugLogger.log("WHERE step - normalized columns: {}", where_columns)
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_WHERE,
+            'input_tables': [input_table],
+            'output_table': output_table,
+            'highlighted_cols': where_columns,
+            'highlighted_rows': [],
+            'dimmed_rows': dimmed_indices[:50],
+            'explanation': f"Step {step_def.get('step_number', 0)}: Filtering rows WHERE {condition}"
+        }
+        
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_FILTERED_RESULT
+        
+        return step_result
+    
+    def _execute_filter_query(
+        self,
+        df: pd.DataFrame,
+        condition: str,
+        result_table_name: str
+    ) -> tuple:
+        """Execute a WHERE/HAVING filter query. Returns (result_df, output_table_dict, dimmed_indices)."""
+        fixed_condition = self._strip_table_aliases(condition)
+        filter_sql = f"SELECT * FROM {TABLE_INPUT} WHERE {fixed_condition}"
+        tables = {TABLE_INPUT: df}
+        
+        result_df = None
+        dimmed_indices = []
+        try:
+            with self._db_connection(tables) as con:
+                result_df = con.execute(filter_sql).fetchdf()
+                # Optimize dimmed indices calculation - only compute if needed for visualization
+                # The result_df indices don't correspond to original df indices after DuckDB processing
+                # So we calculate dimmed rows differently: all rows not in result
+                df_len = len(df)
+                result_len = len(result_df)
+                # For visualization, we can estimate dimmed as rows not matching
+                # This is approximate since DuckDB may reorder
+                if result_len < df_len:
+                    dimmed_indices = list(range(result_len, df_len))
+                output_table = self._dataframe_to_table_dict(result_df, result_table_name)
+        except Exception as e:
+            DebugLogger.log("Filter query failed: {}", e)
+            output_table = None
+            result_df = None
+        
+        return result_df, output_table, dimmed_indices
+    
+    def _execute_having_query(
+        self,
+        df: pd.DataFrame,
+        condition: str,
+        result_table_name: str,
+        aggregates: List[Dict[str, Any]]
+    ) -> tuple:
+        """Execute a HAVING-like filter on an already-grouped table.
+
+        We rewrite aggregate expressions in the original HAVING condition to
+        refer to the alias columns produced by the GROUP BY step (e.g.,
+        SUM(hours) -> sum_hours) and then apply the condition as a WHERE
+        filter on the grouped result.
+        """
+        fixed_condition = self._strip_table_aliases(condition)
+
+        for agg in aggregates or []:
+            func = (agg.get('func') or '').upper()
+            col = (agg.get('column') or '').split('.')[-1]
+            alias = agg.get('alias')
+            if not func or not col or not alias:
+                continue
+            # Use compiled regex with dynamic substitution
+            # Handle both regular and DISTINCT variants
+            pattern = re.compile(
+                rf'\b{re.escape(func)}\s*\(\s*(?:distinct\s+)?{re.escape(col)}\s*\)',
+                flags=re.IGNORECASE,
+            )
+            fixed_condition = pattern.sub(alias, fixed_condition)
+
+        having_sql = f"SELECT * FROM {TABLE_INPUT} WHERE {fixed_condition}"
+        tables = {TABLE_INPUT: df}
+        
+        result_df = None
+        try:
+            with self._db_connection(tables) as con:
+                result_df = con.execute(having_sql).fetchdf()
+                output_table = self._dataframe_to_table_dict(result_df, result_table_name)
+        except Exception as e:
+            DebugLogger.log("HAVING query failed: {}", e)
+            output_table = None
+            result_df = None
+        
+        return result_df, output_table
+    
+    def _execute_group_by_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute GROUP BY step."""
+        if current_df is None:
+            return self._create_error_step(STEP_GROUP_BY, step_def.get('step_number', 0), 'no input')
+        
+        input_table = self._dataframe_to_table_dict(current_df, current_table_name or 'input')
+        group_cols = step_def.get('columns', [])
+        aggregates = step_def.get('aggregates', [])
+        
+        result_df, output_table = self._execute_group_by_query(current_df, group_cols, aggregates)
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_GROUP_BY,
+            'input_tables': [input_table],
+            'output_table': output_table,
+            'highlighted_cols': group_cols,
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 0)}: Grouping by {', '.join(group_cols)}"
+        }
+        
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_GROUPED_RESULT
+        
+        return step_result
+    
+    def _execute_group_by_query(
+        self,
+        df: pd.DataFrame,
+        group_cols: List[str],
+        aggregates: List[Dict[str, Any]]
+    ) -> tuple:
+        """Execute a GROUP BY query. Returns (result_df, output_table_dict).
+
+        If aggregates are provided, we compute them alongside the group keys
+        so that the subsequent HAVING step can filter on the aggregate
+        columns (e.g., SUM(hours) AS sum_hours). Otherwise, we just return
+        distinct group keys.
+        """
+        tables = {TABLE_INPUT: df}
+        
+        # Strip table prefixes from group columns (e.g., "a.pnumber" -> "pnumber")
+        # The intermediate DataFrame after JOINs might or might not have table prefixes
+        actual_df_cols = list(df.columns)
+        actual_df_cols_set = set(actual_df_cols)
+        DebugLogger.log("GROUP BY - actual DataFrame columns: {}", actual_df_cols)
+        
+        # Build lookup maps once for efficiency
+        actual_df_cols_lower_map = {c.lower(): c for c in actual_df_cols}
+        suffix_to_cols = {}  # Maps suffix -> list of columns with that suffix
+        for c in actual_df_cols:
+            if '.' in c:
+                suffix = c.split('.')[-1].lower()
+                if suffix not in suffix_to_cols:
+                    suffix_to_cols[suffix] = []
+                suffix_to_cols[suffix].append(c)
+        
+        normalized_group_cols = []
+        for col in group_cols:
+            matching_col = None
+            
+            # If column has table prefix, try to match by suffix
+            if '.' in col:
+                col_suffix = col.split('.')[-1]
+                # First try exact suffix match
+                if col_suffix in actual_df_cols_set:
+                    matching_col = col_suffix
+                    DebugLogger.log("GROUP BY column '{}' matched by suffix '{}'", col, col_suffix)
+                # Then try full name with prefix
+                elif col in actual_df_cols_set:
+                    matching_col = col
+                    DebugLogger.log("GROUP BY column '{}' matched by full name", col)
+                # Try case-insensitive match on suffix
+                elif col_suffix.lower() in actual_df_cols_lower_map:
+                    matching_col = actual_df_cols_lower_map[col_suffix.lower()]
+                    DebugLogger.log("GROUP BY column '{}' matched case-insensitively to '{}'", col, matching_col)
+                # Try matching with table prefix
+                elif col_suffix.lower() in suffix_to_cols:
+                    matching_col = suffix_to_cols[col_suffix.lower()][0]  # Use first match
+                    DebugLogger.log("GROUP BY column '{}' matched to '{}'", col, matching_col)
+                else:
+                    # Last resort: use suffix and hope DuckDB can resolve it
+                    matching_col = col_suffix
+                    DebugLogger.log("GROUP BY column '{}' not found, using suffix '{}' (may fail)", col, col_suffix)
+            else:
+                # No prefix, use as-is but check if it exists
+                if col in actual_df_cols_set:
+                    matching_col = col
+                # Try case-insensitive match
+                elif col.lower() in actual_df_cols_lower_map:
+                    matching_col = actual_df_cols_lower_map[col.lower()]
+                    DebugLogger.log("GROUP BY column '{}' matched case-insensitively to '{}'", col, matching_col)
+                else:
+                    matching_col = col
+                    DebugLogger.log("GROUP BY column '{}' not found, using as-is (may fail)", col)
+            
+            if matching_col:
+                normalized_group_cols.append(matching_col)
+        
+        DebugLogger.log("GROUP BY columns normalized: {} -> {}", group_cols, normalized_group_cols)
+
+        if aggregates:
+            # Build SELECT with group keys and aggregate expressions.
+            select_parts: List[str] = list(normalized_group_cols)
+            for agg in aggregates:
+                func = agg.get('func', '').upper()
+                col = agg.get('column', '')
+                alias = agg.get('alias', '')
+                if not func or not col or not alias:
+                    continue
+                base_col = col.split('.')[-1]
+                # Check if column exists in DataFrame
+                if base_col not in actual_df_cols:
+                    base_col_lower = base_col.lower()
+                    matching_col = next((c for c in actual_df_cols if c.lower() == base_col_lower), None)
+                    if matching_col:
+                        base_col = matching_col
+                    else:
+                        # Column not found - log warning but continue (may fail at execution)
+                        DebugLogger.log("GROUP BY aggregate column '{}' not found in DataFrame, using as-is (may fail)", base_col)
+                
+                # Handle DISTINCT in aggregate functions
+                has_distinct = agg.get('distinct', False)
+                if has_distinct:
+                    agg_expr = f"{func}(DISTINCT {base_col})"
+                else:
+                    agg_expr = f"{func}({base_col})"
+                select_parts.append(f"{agg_expr} AS {alias}")
+
+            select_sql = ', '.join(select_parts)
+            group_by_sql = f"SELECT {select_sql} FROM {TABLE_INPUT} GROUP BY {', '.join(normalized_group_cols)}"
+        else:
+            # Fallback: distinct group keys only.
+            group_by_sql = f"SELECT DISTINCT {', '.join(normalized_group_cols)} FROM {TABLE_INPUT}"
+        
+        result_df = None
+        try:
+            with self._db_connection(tables) as con:
+                result_df = con.execute(group_by_sql).fetchdf()
+                output_table = self._dataframe_to_table_dict(result_df, TABLE_GROUPED_RESULT)
+        except Exception as e:
+            DebugLogger.log("GROUP BY query failed: {}", e)
+            output_table = None
+            result_df = None
+        
+        return result_df, output_table
+    
+    def _execute_having_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute HAVING step."""
+        if current_df is None:
+            return self._create_error_step(STEP_HAVING, step_def.get('step_number', 0), 'no input')
+        
+        input_table = self._dataframe_to_table_dict(current_df, current_table_name or 'input')
+        condition = step_def.get('condition', '')
+        aggregates = step_def.get('aggregates', [])
+        
+        result_df, output_table = self._execute_having_query(
+            current_df, condition, TABLE_FILTERED_GROUPS, aggregates
+        )
+        
+        having_columns = step_def.get('columns', [])
+        DebugLogger.log("HAVING step - columns from step_def: {}", having_columns)
+        if not having_columns and condition:
+            # Use SQLQueryParser's method for consistency
+            parser = SQLQueryParser()
+            having_columns = parser._extract_columns_from_condition(condition, is_having=True)
+            DebugLogger.log("HAVING step - extracted columns from condition: {}", having_columns)
+
+        # Build highlighted columns:
+        # - Start from columns referenced in the HAVING condition
+        # - Also include aggregate aliases produced by GROUP BY (e.g., sum_hours)
+        highlighted_cols: List[str] = []
+        if current_df is not None:
+            actual_cols = current_df.columns.tolist()
+            DebugLogger.log("HAVING step - actual DataFrame columns: {}", actual_cols)
+
+            if having_columns:
+                normalized = self._normalize_column_names(having_columns, actual_cols)
+                DebugLogger.log("HAVING step - normalized columns from condition: {}", normalized)
+                highlighted_cols.extend(normalized)
+
+            for agg in aggregates or []:
+                alias = agg.get('alias')
+                if alias and alias in actual_cols and alias not in highlighted_cols:
+                    highlighted_cols.append(alias)
+            DebugLogger.log("HAVING step - final highlighted columns: {}", highlighted_cols)
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_HAVING,
+            'input_tables': [input_table],
+            'output_table': output_table,
+            'highlighted_cols': highlighted_cols,
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 0)}: Filtering groups HAVING {condition}"
+        }
+        
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_FILTERED_GROUPS
+        
+        return step_result
+    
+    def _execute_select_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute SELECT step."""
+        if current_df is None:
+            return self._create_error_step(STEP_SELECT, step_def.get('step_number', 0), 'no input')
+        
+        input_table = self._dataframe_to_table_dict(current_df, current_table_name or 'input')
+        select_cols = step_def.get('columns', [])
+        
+        result_df = None
+        if not select_cols:
+            output_table = input_table
+            result_df = current_df
+        else:
+            try:
+                result_df = current_df[select_cols]
+                output_table = self._dataframe_to_table_dict(result_df, 'projected_result')
+            except Exception as e:
+                output_table = input_table
+                result_df = current_df
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_SELECT,
+            'input_tables': [input_table],
+            'output_table': output_table,
+            'highlighted_cols': select_cols,
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 0)}: Selecting columns {', '.join(select_cols) if select_cols else 'ALL'}"
+        }
+        
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_PROJECTED_RESULT
+        
+        return step_result
+    
+    def _execute_order_by_step(
+        self, 
+        step_def: Dict, 
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str
+    ) -> Dict[str, Any]:
+        """Execute ORDER BY step."""
+        if current_df is None:
+            return self._create_error_step(STEP_ORDER_BY, step_def.get('step_number', 0), 'no input')
+        
+        input_table = self._dataframe_to_table_dict(current_df, current_table_name or 'input')
+        order_cols = step_def.get('columns', [])
+        
+        result_df, output_table = self._execute_order_by_query(current_df, order_cols, input_table)
+        
+        step_result = {
+            'step_number': step_def.get('step_number', 0),
+            'step_type': STEP_ORDER_BY,
+            'input_tables': [input_table],
+            'output_table': output_table,
+            'highlighted_cols': order_cols,
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_def.get('step_number', 0)}: Sorting by {', '.join(order_cols)}"
+        }
+        
+        # Store DataFrame reference for next step (if any follow)
+        if result_df is not None:
+            step_result['_dataframe'] = result_df
+            step_result['_table_name'] = TABLE_SORTED_RESULT
+        
+        return step_result
+    
+    def _execute_order_by_query(
+        self,
+        df: pd.DataFrame,
+        order_cols: List[str],
+        fallback_table: Dict[str, Any]
+    ) -> tuple:
+        """Execute an ORDER BY query. Returns (result_df, output_table_dict)."""
+        tables = {TABLE_INPUT: df}
+        order_by_sql = f"SELECT * FROM {TABLE_INPUT} ORDER BY {', '.join(order_cols)}"
+        
+        result_df = None
+        try:
+            with self._db_connection(tables) as con:
+                result_df = con.execute(order_by_sql).fetchdf()
+                output_table = self._dataframe_to_table_dict(result_df, TABLE_SORTED_RESULT)
+        except Exception as e:
+            DebugLogger.log("ORDER BY query failed: {}", e)
+            output_table = fallback_table
+            result_df = df  # Fallback to input if ORDER BY fails
+        
+        return result_df, output_table
+
+    def _execute_union_input_step(
+        self,
+        step_def: Dict,
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str,
+    ) -> Dict[str, Any]:
+        """Execute one side of a UNION as its own step.
+
+        This runs the stored SELECT subquery against the current tables in
+        `graph_builder` using DuckDB and exposes the result as an intermediate
+        table.
+        """
+        side = step_def.get('side', 'left')
+        subquery_sql = step_def.get('query', '')
+        step_number = step_def.get('step_number', 0)
+
+        tables = self._get_tables_as_dataframes()
+        if not tables:
+            return self._create_error_step(STEP_UNION_INPUT, step_number, 'no tables available')
+
+        try:
+            with self._db_connection(tables) as con:
+                result_df: pd.DataFrame = con.execute(subquery_sql).fetchdf()
+        except RuntimeError:
+            return self._create_error_step(STEP_UNION_INPUT, step_number, 'DuckDB is not installed')
+        except Exception as exc:
+            DebugLogger.log("UNION_INPUT step failed for side {}: {}", side, exc)
+            return self._create_error_step(
+                STEP_UNION_INPUT,
+                step_number,
+                f'error executing {side} SELECT of UNION: {exc}',
+            )
+
+        table_name = f'union_{side}_result'
+        output_table = self._dataframe_to_table_dict(result_df, table_name)
+
+        step_result = {
+            'step_number': step_number,
+            'step_type': STEP_UNION_INPUT,
+            'input_tables': [],
+            'output_table': output_table,
+            'highlighted_cols': [],
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_number}: Executing {side.upper()} SELECT of UNION",
+        }
+
+        step_result['_dataframe'] = result_df
+        step_result['_table_name'] = table_name
+
+        return step_result
+
+    def _execute_union_step(
+        self,
+        step_def: Dict,
+        current_df: Optional[pd.DataFrame],
+        current_table_name: Optional[str],
+        full_query: str,
+    ) -> Dict[str, Any]:
+        """Execute the UNION step that combines two SELECT subqueries."""
+        step_number = step_def.get('step_number', 0)
+        left_query = step_def.get('left_query', '')
+        right_query = step_def.get('right_query', '')
+        
+        # Check if we have pre-computed results from step-by-step execution
+        left_df = step_def.get('_left_df')
+        right_df = step_def.get('_right_df')
+
+        if left_df is None or right_df is None:
+            # Fallback: execute queries directly
+            if not left_query or not right_query:
+                return self._create_error_step(STEP_UNION, step_number, 'missing UNION subqueries')
+
+            tables = self._get_tables_as_dataframes()
+            if not tables:
+                return self._create_error_step(STEP_UNION, step_number, 'no tables available')
+
+            try:
+                with self._db_connection(tables) as con:
+                    left_df = con.execute(left_query).fetchdf()
+                    right_df = con.execute(right_query).fetchdf()
+            except RuntimeError:
+                return self._create_error_step(STEP_UNION, step_number, 'DuckDB is not installed')
+            except Exception as exc:
+                DebugLogger.log("UNION step failed: {}", exc)
+                return self._create_error_step(
+                    STEP_UNION,
+                    step_number,
+                    f'error executing UNION subqueries: {exc}',
+                )
+
+        # Combine the dataframes using pandas concat (UNION removes duplicates)
+        # Optimize: use ignore_index=True to avoid index conflicts, then drop duplicates efficiently
+        union_df = None
+        try:
+            # Concatenate and drop duplicates in one go
+            union_df = pd.concat([left_df, right_df], ignore_index=True)
+            union_df = union_df.drop_duplicates().reset_index(drop=True)
+        except Exception as exc:
+            DebugLogger.log("UNION concatenation failed: {}", exc)
+            return self._create_error_step(
+                STEP_UNION,
+                step_number,
+                f'error combining UNION results: {exc}',
+            )
+
+        left_table_dict = self._dataframe_to_table_dict(left_df, 'left_result')
+        right_table_dict = self._dataframe_to_table_dict(right_df, 'right_result')
+        output_table = self._dataframe_to_table_dict(union_df, 'union_result')
+
+        step_result = {
+            'step_number': step_number,
+            'step_type': STEP_UNION,
+            'input_tables': [left_table_dict, right_table_dict],
+            'output_table': output_table,
+            'highlighted_cols': [],
+            'highlighted_rows': [],
+            'dimmed_rows': [],
+            'explanation': f"Step {step_number}: UNION - combining results from both SELECT statements",
+        }
+
+        step_result['_dataframe'] = union_df
+        step_result['_table_name'] = 'union_result'
+
+        return step_result
+
+    # ------------------------------------------------------------------
+    # Backwards-compat convenience wrapper
+    # ------------------------------------------------------------------
+    
+    def compile_query(
+        self, query_text: str, query_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Keep old name alive but simply run the query once."""
+        query_id = query_id or f"query_{hash(query_text)}"
+        result = self.execute_query(query_text)
+        return {"query_id": query_id, "result": result}
+
+    def get_visual_state(
+        self, query_id: str, line_index: int, sub_step_index: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Legacy API no longer supported."""
+        raise RuntimeError(
+            "Step-by-step visual query states have been removed; "
+            "call `execute_query` instead."
+        )

@@ -294,36 +294,31 @@ async def find_join_path(
 
 @app.post("/api/query/compile")
 async def compile_query(request: Dict = Body(...)):
-    """Compile a SQL query into semantic steps"""
+    """
+    Execute a SQL query and return its output.
+    
+    Supports two modes:
+    - mode="final" (default): Returns only final result (existing behavior)
+    - mode="steps": Returns step-by-step visualization data + final result
+    """
     try:
-        query_text = request.get('query')
-        query_id = request.get('query_id')
-        
+        query_text = request.get("query")
+        mode = request.get("mode", "final")  # Default to "final" to preserve existing behavior
+
         if not query_text:
             raise HTTPException(status_code=400, detail="Query text is required")
-        
-        result = query_visualizer.compile_query(query_text, query_id)
-        
-        # Convert steps to JSON-serializable format
-        serializable_result = {
-            'steps': [
-                {
-                    'type': step['type'],
-                    'description': step.get('description', ''),
-                    'line_range': step.get('line_range', (0, 0)),
-                    **{k: v for k, v in step.items() if k not in ['line_range'] and isinstance(v, (str, int, float, list, dict, type(None)))}
-                }
-                for step in result['steps']
-            ],
-            'sub_steps': result.get('sub_steps', []),  # Granular steps for frontend
-            'line_to_step': result['line_to_step'],
-            'line_count': result['line_count'],
-            'total_steps': result.get('total_steps', len(result['steps'])),
-            'total_sub_steps': result.get('total_sub_steps', len(result.get('sub_steps', []))),
-            'query_id': result['query_id']
-        }
-        
-        return serializable_result
+
+        if mode == "steps":
+            # Return step-by-step data
+            result = query_visualizer.execute_query_steps(query_text)
+            return result
+        else:
+            # Return only final result (existing behavior - DO NOT CHANGE)
+            result = query_visualizer.execute_query(query_text)
+            # `result` is already JSON-serializable (columns, rows, row_count)
+            return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

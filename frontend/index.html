@@ -69,6 +69,10 @@
             <!-- Query Visualizer Controls -->
             <div class="sidebar-section" id="queryControls" style="display: none;">
                 <h2>Query Visualizer</h2>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="stepByStepMode" onchange="queryVisualizer.toggleStepByStep()">
+                    <label for="stepByStepMode">Step-by-Step Visualization</label>
+                </div>
                 <div class="step-controls">
                     <div class="step-info">
                         <span id="currentLineInfo">Step 0 / 0</span>

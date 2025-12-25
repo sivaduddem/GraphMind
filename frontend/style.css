@@ -1199,8 +1199,55 @@ body {
     background: #f8f9fa;
 }
 
+.table-container tr.highlighted-row {
+    background: #fff9c4 !important;
+    border-left: 3px solid #fbc02d;
+}
+
 .table-container tr:hover:not(.dimmed-row) {
     background: #f0f8ff;
+}
+
+/* Join tables container */
+.join-tables-container {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.join-input-table {
+    flex: 1;
+    min-width: 300px;
+}
+
+.join-arrow {
+    text-align: center;
+    font-size: 18px;
+    font-weight: bold;
+    color: #2c3e50;
+    margin: 20px 0;
+    padding: 10px;
+    background: #f8f9fa;
+    border-radius: 4px;
+}
+
+/* Smooth transitions for step changes */
+.transformation-canvas {
+    transition: opacity 0.3s ease-in-out;
+}
+
+/* Enhanced highlighting */
+.table-container th.highlighted-col,
+.table-container td.highlighted-col {
+    background: #e3f2fd !important;
+    color: #1976d2;
+    font-weight: 600;
+    border: 2px solid #64b5f6;
+}
+
+.table-container th.highlighted-col {
+    background: #bbdefb !important;
 }
 
 .empty-table {
@@ -1288,6 +1335,11 @@ body {
 .step-badge.step-select {
     background: #e0f2f1;
     color: #00796b;
+}
+
+.step-badge.step-order_by {
+    background: #fff9e6;
+    color: #f57c00;
 }
 
 .column-tags {
